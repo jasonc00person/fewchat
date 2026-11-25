@@ -98,7 +98,10 @@ npm test            # vitest, real SQL via a node:sqlite D1 shim (test/d1shim.ts
 npm run typecheck
 npm run deploy      # refuses while setup isn't finished
 npx wrangler tail   # live logs
+node scripts/fc.mjs # automations from the terminal: list, show, posts, comments, copy, set, publish, on/off, test, trash
 ```
+
+**Use `scripts/fc.mjs` for automation work instead of driving the console in a browser.** It changes automations through the console's own endpoints (so the editor's validation runs), signed in with `ADMIN_PASSWORD` from `.env`, at `ORIGIN` from `src/brand.ts`; lists read D1 through wrangler. A follow-up post on the same keyword is `node scripts/fc.mjs copy <id> --post next --publish`, run before the post goes up. Each automation has its own one-DM-per-person, so someone who comments on both posts gets both DMs.
 
 ## Lab Notes
 
