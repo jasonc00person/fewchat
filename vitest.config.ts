@@ -1,9 +1,10 @@
 import { fileURLToPath } from "node:url";
 import { configDefaults, defineConfig } from "vitest/config";
 
-// Tests run against test/brand.ts, never your filled-in src/brand.ts, so they pass before and after setup.
-// Parallel sessions keep their git worktrees under .claude/worktrees/; their in-progress tests aren't ours.
+// Tests run against the stand-ins in test/ (brand, script, product facts), never your own files in src/, so they pass
+// before and after setup, whatever you fill in.
+const standIn = (name: string) => ({ find: new RegExp(`^\\./${name}$`), replacement: fileURLToPath(new URL(`./test/${name}.ts`, import.meta.url)) });
 export default defineConfig({
-  resolve: { alias: [{ find: /^\.\/brand$/, replacement: fileURLToPath(new URL("./test/brand.ts", import.meta.url)) }] },
+  resolve: { alias: [standIn("brand"), standIn("prompt"), standIn("knowledge")] },
   test: { exclude: [...configDefaults.exclude, ".claude/**"] },
 });

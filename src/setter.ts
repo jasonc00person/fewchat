@@ -7,6 +7,7 @@ import * as db from "./db";
 import { logError } from "./health";
 import { fillTracked, leadMagnet, liveMagnets } from "./links";
 import { liveKnowledge } from "./learn";
+import { aiBlocker } from "./ready";
 import { customerLine } from "./roster";
 import { ping } from "./live";
 import { enrichPending } from "./media";
@@ -148,6 +149,7 @@ async function onlyOurs(env: Env, leadId: string, lastLeadId: number, after: { r
 export async function draftFor(env: Env, lead: db.Lead, now: number, mode: "reply" | "follow_up" = "reply"): Promise<db.Draft | null> {
   if (db.isGroup(lead.subscriber_id)) return null; // group chats: never
   if (await db.isFriend(env.DB, lead)) return null; // friends & family: never
+  if (aiBlocker(env)) return null; // no script or no API key yet: nothing to draft with
   if (!(await lockLead(env.DB, lead.subscriber_id, now))) return null;
   await ping(env, lead.subscriber_id); // the Inbox shows the AI typing
   try {

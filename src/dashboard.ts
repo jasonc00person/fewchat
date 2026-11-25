@@ -14,6 +14,7 @@ import { COMMUNITY, skoolLinkSql } from "./brand";
 import { react } from "./meta";
 import { flowChart } from "./flowchart";
 import { waitingLeads } from "./health";
+import { aiBlocker } from "./ready";
 import { getConfig, saveConfig } from "./settings";
 import { ping } from "./live";
 import { sendDraft, type Env } from "./setter";
@@ -190,14 +191,19 @@ export async function aiPage(env: Env, who: Role, range: Range, now: number, sav
     waiting.broken ? problemRow("AI not answering", `${waiting.broken} leads wrote 30+ min ago and the AI is on for them, but nothing was drafted.`, "now") : "",
     waiting.offWaiting ? problemRow("AI is off", `${waiting.offWaiting} leads wrote 30+ min ago and nobody has answered them.`, "now") : "",
   ].join("");
+  // No script or no API key yet: the switch says what's missing and can't be turned on (turning off always works).
+  const blocker = aiBlocker(env);
+  const canSwitch = aiOn || !blocker;
   return page(
     "AI",
     `<div class="card aisw"><div><h2>AI replies ${aiOn ? "on" : "off"}</h2><p class="sub">${
-      aiOn
-        ? "The AI answers DMs on its own within seconds, in your voice, from your script."
-        : "The AI writes nothing. Automations still run and you reply from the Inbox. You can turn it on for one conversation from its thread."
+      blocker && !aiOn
+        ? `${esc(blocker)} Everything else works without it: automations still run and you reply from the Inbox.`
+        : aiOn
+          ? "The AI answers DMs on its own within seconds, in your voice, from your script."
+          : "The AI writes nothing. Automations still run and you reply from the Inbox. You can turn it on for one conversation from its thread."
     }</p></div>
-<form method="post" action="/admin/ai"><button type="${who === "admin" ? "submit" : "button"}" aria-pressed="${aiOn}">${aiOn ? "Turn off" : "Turn on"}<span class="tog${aiOn ? " on" : ""}"></span></button></form></div>
+<form method="post" action="/admin/ai"><button type="${who === "admin" && canSwitch ? "submit" : "button"}" aria-pressed="${aiOn}"${canSwitch ? "" : " disabled"}>${aiOn ? "Turn off" : canSwitch ? "Turn on" : "Not set up yet"}<span class="tog${aiOn ? " on" : ""}"></span></button></form></div>
 <div class="stats">${[
       stat(conversations, "Conversations", "users"),
       stat(aiSent, "AI messages sent", "bot", who === "admin" ? `$${spend.toFixed(2)} in AI · ${label}` : label),
@@ -732,6 +738,7 @@ export async function consoleRoute(env: Env, req: Request, pathname: string, who
   if (pathname === "/admin/ai" && req.method === "POST") {
     if (who !== "admin") return forbidden;
     const c = await getConfig(env);
+    if (!c.autopilot && aiBlocker(env)) return Response.redirect(new URL("/admin/ai", req.url).toString(), 303); // the page says what's missing
     await saveConfig(env.DB, { ...c, autopilot: !c.autopilot });
     return Response.redirect(new URL(req.headers.get("Referer") ?? "/admin/ai", req.url).toString(), 303);
   }
@@ -780,6 +787,7 @@ export async function consoleRoute(env: Env, req: Request, pathname: string, who
         env.DB.prepare(`UPDATE drafts SET status = 'superseded' WHERE subscriber_id = ?1 AND status = 'pending'`).bind(lead.subscriber_id),
       ]);
     } else {
+      if (aiBlocker(env)) return Response.redirect(new URL("/admin/ai", req.url).toString(), 303); // nothing to answer with yet
       await env.DB.prepare(
         `UPDATE leads SET ai_on = 1, status = 'active', paused_reason = NULL, paused_at = NULL,
            followup_due_at = CASE WHEN (SELECT role FROM messages WHERE subscriber_id = ?1 ORDER BY id DESC LIMIT 1) = 'bot' THEN ?2 END

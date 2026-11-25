@@ -1,102 +1,111 @@
 # SETUP.md: from this folder to a live FewChat
 
-Claude runs this top to bottom when the user says "set this up". Do every step you can with your own tools; the user only does what needs their hands (accounts, payment, clicks inside Meta's and Cloudflare's dashboards, pasting their API key into `.env`). Tick each step off in chat as it lands, and verify each one where it lands before moving on.
+**If you're a person:** you don't need this page. Run `npm run setup` and follow it. The README has the short version.
 
-**Secrets never go in chat.** The user types them into `.env` themselves; you push them with `grep '^NAME=' .env | cut -d= -f2- | npx wrangler secret put NAME`, so the value never prints. Never `cat .env`.
+**If you're Claude (or another coding agent):** the user said "set this up". This page is your runbook. Assume they have never used a terminal: explain each step in a sentence of plain words before you do it, do everything you can yourself, and only hand them what needs their hands (signing in, clicking in Meta's dashboard, pasting a secret into `.env`). One thing at a time. Tick steps off in chat as they land.
 
-## 0. What the user needs first (about 30 minutes, once)
+## Rules
 
-- A Mac, Windows or Linux machine with **Node 22+** (`node -v`). Install from nodejs.org if missing.
-- An **Instagram professional account** (Business or Creator: Instagram app → Settings → Account type and tools).
-- A **Cloudflare account** (free to create at dash.cloudflare.com). **Workers Paid ($5/mo) is strongly recommended**: the free plan's 5M database reads/day runs out with a busy inbox, and then the console, webhook and cron all stop until midnight UTC.
-- An **Anthropic API key** (console.anthropic.com → API keys) with billing on. Replies are drafted by Claude Opus; expect a few cents per conversation.
-- A **Meta developer account** (developers.facebook.com, log in with the Facebook account that manages the Instagram account).
+- **`npm run setup` does the work.** Don't run wrangler commands by hand, don't edit `wrangler.jsonc` or `src/brand.ts` (they are built from `templates/` and `fewchat.config.json`), and don't re-implement its steps. If it stops, it says why and what to do; fix that and run it again. It always continues where it left off.
+- **Secrets never go in chat.** The user pastes them into `.env` themselves. Never `cat .env`, never read `MY-SETUP.md` aloud (it holds their console password): tell the user to open it.
+- **Never use `--replace`** unless the user says the existing Worker is an old FewChat of theirs.
+- You can't answer the script's questions as it runs, so pass the answers as flags (below). Run by an agent, it never asks: it pauses, prints what it needs, and exits.
 
-## 1. Install
+## 0. Before you start
 
-```bash
-npm ci
-npx wrangler login
-```
+Check, and help with whatever is missing:
 
-`wrangler login` opens the browser; the user approves. Check with `npx wrangler whoami`. Then `npm test` and `npm run typecheck` must both pass before anything else.
+- `node -v` is 22 or newer. If not: nodejs.org, the LTS installer, then reopen the terminal.
+- They have an **Instagram professional account** (Business or Creator). In the Instagram app: Settings → Account type and tools → Switch to professional account. Free.
+- They have a **Facebook account** they can log in to (for Meta's developer site).
+- A **Cloudflare account** is created during setup if they don't have one. Free to start.
 
-## 2. Make it theirs (brand, script, knowledge)
+## 1. Three answers
 
-Interview the user, one short question at a time, then fill every `<<FILL: ...>>` and `REPLACE_...` (except `ORIGIN`, the D1 id and the Instagram app id, which come in steps 3-5):
+Ask, one at a time:
 
-1. **`src/brand.ts`**: Instagram handle, business or legal name (shows on the privacy policy), website, contact email, community name, Skool slug (`skool.com/<slug>`). Also set `SKOOL_LINK` in `wrangler.jsonc` to the join link (usually `https://www.skool.com/<slug>/about`).
-2. **`src/prompt.ts`**: what they sell, price, what's inside, member wins, who buys. **The voice comes from their real DMs, not from adjectives**: ask them to paste 10-20 messages they typed by hand to leads or members (screenshots work), and pull the phrases, length, casing and emoji habits from those. Keep the framework, objections and actions as written; only rephrase the quoted lines to sound like them.
-3. **`src/knowledge.ts`**: the facts people ask before buying (price, what's inside, setup, requirements, the honest "no" answers), plus a section for each freebie their automations send.
+1. Their Instagram username.
+2. Their name or business name. It's shown on the privacy page Meta requires.
+3. A contact email. Also shown on that page, so one they're fine with being public.
 
-Then run `npm test` again (it runs against `test/brand.ts`, so it should still pass) and `node scripts/preflight.mjs` to see what's left.
+Optional: their website, and one link their DMs should be able to send (a site, shop or community). Without one, setup uses their Instagram profile, and they can change it later in the console's Settings.
 
-## 3. Cloudflare resources
-
-```bash
-npx wrangler d1 create fewchat            # copy the database_id into wrangler.jsonc
-npx wrangler queues create fewchat-send
-npm run db:setup                             # schema.sql + every migration, in order
-```
-
-Verify: `npx wrangler d1 execute fewchat --remote --command "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"` returns a few dozen tables.
-
-## 4. Secrets + first deploy
-
-Copy `.env.example` to `.env`, then generate the three internal secrets into it:
+## 2. Run setup
 
 ```bash
-for k in INBOUND_SECRET ADMIN_PASSWORD META_VERIFY_TOKEN; do sed -i.bak "s/^$k=.*/$k=$(openssl rand -hex 16)/" .env; done; rm .env.bak
+npm run setup -- --handle=<username> --business="<name>" --email=<email>
 ```
 
-Ask the user to paste their Anthropic key into `.env` as `ANTHROPIC_API_KEY=` and say done. Push each of the four with the `grep | wrangler secret put` line above.
+Add `--website=<site>` and `--link=<https link>` if they gave them.
 
-Deploy once with the placeholders still in `ORIGIN` and the Instagram app id, to learn the URL: `npx wrangler deploy` (bypasses the preflight on purpose, this one time). Wrangler prints `https://fewchat.<subdomain>.workers.dev`. Put that in `ORIGIN` in `src/brand.ts`. Open `<ORIGIN>/privacy` in the browser: it should show their business name and handle.
+A browser tab opens for Cloudflare: tell them to sign in (or create a free account) and click **Allow**. Then setup creates the database and queue, builds the tables, makes their passwords, puts FewChat live, and writes `MY-SETUP.md`. It pauses at "Waiting on the Meta app".
 
-The user's console password is `ADMIN_PASSWORD` in `.env`: tell them where it is, don't print it.
+If it pauses earlier:
 
-## 5. The Meta app (the user clicks, you guide)
+- **More than one Cloudflare account**: it lists them. Ask which, run again with `--account=<id>`.
+- **No workers.dev address yet** (brand-new Cloudflare accounts): they pick a subdomain once at dash.cloudflare.com → Workers & Pages. Then run setup again.
+- **A Worker with this name already exists**: ask whether it's an old FewChat of theirs. If not, run again with `--name=fewchat-2`.
+- **Anything about their plan**: Workers Paid, $5 a month, at dash.cloudflare.com → Workers & Pages → Plans.
 
-On developers.facebook.com → My Apps:
+## 3. The Meta app (the user clicks, you guide)
 
-1. **Create app** → use case "Other" → type **Business** → name it (e.g. "FewChat"), attach their business portfolio if they have one.
-2. Add the **Instagram** product → **API setup with Instagram login**.
-3. Copy the **Instagram app ID** into `META_IG_APP_ID` in `wrangler.jsonc`. Have the user paste the **Instagram app secret** into `.env` as `META_APP_SECRET=`, then push it as a secret.
-4. **Configure webhooks**: callback URL `<ORIGIN>/meta`, verify token = `META_VERIFY_TOKEN` from `.env` (the user copies it from the file). Verify and save, then turn on the fields `messages`, `messaging_postbacks`, `messaging_seen`, `messaging_referral`, `message_reactions`, `message_edit`, `comments`, `live_comments`.
-5. **Set up Instagram business login** (expand section 3 on the API setup page first; the button does nothing while it's collapsed): OAuth redirect URI `<ORIGIN>/auth/callback`.
-6. **App settings → Basic**: Privacy policy URL `<ORIGIN>/privacy`, Terms URL `<ORIGIN>/terms`, User data deletion → Data deletion callback `<ORIGIN>/data-deletion`, App domain = the workers.dev host, a category and an app icon. Under Instagram → "Deauthorize callback URL" `<ORIGIN>/deauthorize` and "Data deletion request URL" `<ORIGIN>/data-deletion`.
-7. **App roles → Roles → Instagram Testers**: add their Instagram account, then accept it in the Instagram app (Settings → Website permissions → Apps and websites → Tester invites).
-8. Switch the app to **Live** (top of the dashboard). Meta may ask for a Data Use Checkup or business verification first; the user completes it. **App Review is not needed** for an account they own (Standard Access).
+Tell the user to open `MY-SETUP.md` in this folder: it has the 9 steps with their own addresses already filled in, to copy and paste. Walk them through one step at a time and wait for "done" after each. Their address is the `url` in `fewchat.config.json`, if you need to refer to it.
 
-Now `npm run deploy` (the preflight must pass: no `<<FILL` or `REPLACE` left anywhere).
+The steps, so you can answer questions (in every address, `<url>` is theirs):
 
-## 6. Connect Instagram
+1. developers.facebook.com/apps, logged in with the Facebook account that manages the Instagram account. Register as a developer if asked.
+2. **Create app** → any name → use case **Other** → type **Business**.
+3. Add the **Instagram** product → **API setup with Instagram login**.
+4. Note the **Instagram app ID** and **Instagram app secret** on that page.
+5. **Configure webhooks**: callback URL `<url>/meta`, verify token from `MY-SETUP.md`. Verify and save, then switch on the fields `messages`, `messaging_postbacks`, `messaging_seen`, `messaging_referral`, `message_reactions`, `message_edit`, `comments`, `live_comments`.
+6. **Set up Instagram business login** (unfold that section first: the button does nothing while it's folded) → Business login settings: OAuth redirect URI `<url>/auth/callback`, deauthorize callback `<url>/deauthorize`, data deletion request URL `<url>/data-deletion`.
+7. **App settings → Basic**: app domain (the address without `https://`), privacy policy URL `<url>/privacy`, terms URL `<url>/terms`, data deletion callback `<url>/data-deletion`, a category, an app icon (`assets/icon.png` works). Save.
+8. **App roles → Roles**: add their Instagram account as an **Instagram tester**, then accept it in Instagram: Settings → Website permissions → Apps and websites → Tester invites.
+9. Switch the app from Development to **Live**. Meta may ask for a data use checkup or business details first. **App Review is not needed** for an account they own.
 
-Open `<ORIGIN>/admin/password`, log in with `ADMIN_PASSWORD`, then open `<ORIGIN>/auth/start` and approve the Instagram consent screen (three permissions: basic, messages, comments). From then on **Log in with Instagram** at `<ORIGIN>/login` works, and only for that account (the password stays as the fallback).
+Meta moves things around. If a label isn't where a step says, look for the nearest match on the same page before sending the user elsewhere.
 
-Verify: the sidebar shows their name and handle under the logo, and My Profile shows the account.
+Then:
 
-## 7. Prove it end to end (before the AI talks to anyone)
+- Have the user paste the **Instagram app secret** into `.env`, after `META_APP_SECRET=`, and say done.
+- Ask for the **Instagram app ID** (a number, not secret) and run:
 
-The master AI switch stays **off**. From a second Instagram account (a friend's or a spare), with `npx wrangler tail` running:
+```bash
+npm run setup -- --app-id=<Instagram app ID>
+```
 
-1. **DM**: send the account a DM. It must show in the Inbox within seconds (no webhook hit in the tail = step 5.4 or 5.8 isn't done). In that thread, flip "AI off · turn on here" and send another DM from the second account: the setter should read it, show typing, and reply in their voice. Turn it back off.
-2. **Comment-to-DM**: Automations → new automation from a template → a comment trigger with a test keyword on one post → Publish. Comment the keyword from the second account: a private-reply DM must arrive within seconds.
-3. **Voice note**: send a voice note from the second account in the AI-on thread; the reply should react to what was said.
+It stores the secret, puts the final version live and pauses at "Connect your Instagram account".
 
-Read 5-10 drafted replies with the user. Anything off-voice → fix `src/prompt.ts`; any wrong or missing fact → `src/knowledge.ts`; `npm run deploy`.
+## 4. Connect Instagram
 
-## 8. Go live
+Tell the user to, on a computer (the button isn't shown on phones):
 
-When the user is happy: open **AI** in the sidebar and turn **AI replies** on. From then on it answers every DM within seconds, inside Instagram's 24h window.
+1. Open `<url>/login` and click **Log in with Instagram**.
+2. Log in as the account they gave in step 1 and approve the three permissions. The first sign-in connects the account; any other Instagram account is turned away.
 
-Optional, ask the user about each:
-- **Phone alerts** (recommended): install the ntfy app, subscribe to a long random topic, `ALERT_TOPIC=<topic>` into `.env` and push it.
-- **Link tracking**: Settings → track links (counts clicks per lead, needed for join matching).
-- **Skool customers + join verification**: the user copies their Skool `auth_token` cookie (skool.com → browser dev tools → Application → Cookies) into `.env` as `SKOOL_AUTH_TOKEN=` and you push it. Members are then never pitched and joins from the DMs are confirmed on the Dashboard.
-- **Friends & family**: Settings → Friends & family, add the @usernames the AI must never answer.
-- **Manychat users**: `MANYCHAT_API_KEY` (Manychat → Settings → API) so the setter can reply in threads Manychat owns. Move keyword automations over one at a time; turn each one OFF in Manychat the moment it's live here (see CLAUDE.md "Manychat").
-- **Import past DMs**: `scripts/backfill.mjs` (see CLAUDE.md Lab Notes), so the Inbox and the AI know who they've already talked to. 90 days is plenty.
-- **Bot disclosure**: `DISCLOSE` in `src/autonomy.ts`; their call, mention California's bot law.
+If Instagram shows an error instead, it names the cause (the redirect URI from Meta step 6, or the tester invite from step 8). They can always get in with the password from `MY-SETUP.md` on the same page, then click **Connect Instagram** at the top left.
 
-Done = a real lead got a reply from the AI that the user would have sent themselves.
+Then run:
+
+```bash
+npm run check
+```
+
+Every line should have a ✓ except "Nothing has ever arrived from Instagram", which is next.
+
+## 5. Prove it
+
+From a **second** Instagram account (a friend's or a spare; a message to yourself doesn't count):
+
+1. **A DM.** Send the account a DM. It should be in the console's Inbox within seconds, and `npm run check` now shows Instagram's last delivery. Nothing arriving means step 9 (not Live) or step 5 (webhook) in almost every case.
+2. **A comment automation.** In the console: Automation → New Automation → the template **Comment keyword → DM link** → pick a post, a test keyword and their link → **Publish**. Comment the keyword from the second account: the DM arrives within seconds.
+
+Done = both worked. Show them where things are: the console address, `MY-SETUP.md`, `npm run check`, `npm run update`.
+
+## 6. Offer the extras, one question each
+
+- **Phone alerts** (recommended): install the free ntfy app, subscribe to a long random topic, put it in `.env` as `ALERT_TOPIC=`, run `npm run setup`.
+- **Workers Paid** ($5 a month): once people message them daily. See docs/HOW-IT-WORKS.md, "What it costs to run".
+- **AI replies (beta)**: docs/AI.md. When they say "help me write the AI script": interview them one short question at a time (what they sell, the price, what's inside, real member results, who buys), and ask them to paste 10 to 20 messages they really typed to people in their DMs. Build the voice from those messages, not from adjectives. Fill every `<<FILL: ...>>` in `src/prompt.ts` and `src/knowledge.ts`, keep the framework, objections and actions as written, then `npm run setup`. They add `ANTHROPIC_API_KEY=` to `.env` themselves.
+- **Also running Manychat on this account?** Read CLAUDE.md, "Manychat", before moving any keyword over.
+- **Past conversations**: `scripts/backfill.mjs` imports DM history (CLAUDE.md, Lab Notes). 90 days is plenty.

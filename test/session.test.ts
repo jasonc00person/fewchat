@@ -29,14 +29,19 @@ function makeEnv(): Env {
 }
 
 let meId = OWNER;
+let meName = "";
+let calls: string[] = [];
 beforeEach(() => {
   meId = OWNER;
+  meName = "";
+  calls = [];
   vi.stubGlobal(
     "fetch",
     vi.fn(async (url: string) => {
+      calls.push(url);
       if (url.includes("api.instagram.com/oauth/access_token")) return Response.json({ access_token: "short", user_id: 33900000000000001 });
       if (url.includes("graph.instagram.com/access_token")) return Response.json({ access_token: "long" });
-      if (url.includes("/me?fields=user_id")) return Response.json({ user_id: meId });
+      if (url.includes("/me?fields=user_id")) return Response.json({ user_id: meId, username: meName });
       return Response.json({});
     }),
   );
@@ -91,6 +96,27 @@ describe("log in with Instagram", () => {
     expect(no.status).toBe(403);
     expect(no.headers.get("Set-Cookie")).not.toContain("dms_session="); // only the state cookie is cleared
     expect(await no.text()).toContain("the one this setter runs");
+  });
+
+  it("the first sign-in on a fresh install claims and connects it, and only the account it was set up for can", async () => {
+    const env = makeEnv();
+    // The handle this install was set up for, as the login page shows it.
+    const handle = (await (await worker.fetch(new Request("https://x/login"), env, ctx)).text()).match(/name="username"[^>]*value="([^"]+)"/)![1];
+
+    meName = "someone.else";
+    const stranger = await loginFlow(env);
+    expect(await stranger.text()).toContain(`set up for @${handle}`);
+    expect(await db.getSetting(env.DB, "ig_account_id")).toBeNull();
+    expect(await db.getSetting(env.DB, "ig_token")).toBeNull();
+
+    meName = handle.toUpperCase(); // Instagram usernames aren't case-sensitive
+    const owner = await loginFlow(env);
+    expect(owner.status).toBe(303);
+    expect(await hasSession(withCookie("/admin/dashboard", cookieOf(owner)), env)).toBe(true);
+    expect(await db.getSetting(env.DB, "ig_account_id")).toBe(OWNER);
+    expect(await db.getSetting(env.DB, "ig_token")).toBe("long");
+    expect(await db.getSetting(env.DB, "ig_user_id")).toBeTruthy(); // connected, as /auth/start would
+    expect(calls.some((u) => u.includes("/me/subscribed_apps"))).toBe(true); // DMs and comments now arrive
   });
 
   it("a forged state, or one from another browser, can't log anyone in, and shows the login page", async () => {

@@ -1,3 +1,4 @@
+import { IG_HANDLE } from "./brand";
 import { clearCookie, isPhone, loginPage, ownerId, sessionCookie } from "./session";
 import { handleEcho } from "./autonomy";
 import { afterInbound } from "./fastpath";
@@ -111,11 +112,22 @@ async function handleAuth(req: Request, env: Env, pathname: string): Promise<Res
     if (login) {
       // Compare Instagram account ids from /me: OAuth's user_id is app-scoped and arrives as a lossy JSON number.
       const owner = await ownerId(env).catch(() => null);
-      const who = (await graph<{ user_id: string }>(`/me?fields=user_id`, { headers: { Authorization: `Bearer ${token}` } })).user_id;
+      const me = await graph<{ user_id: string; username?: string }>(`/me?fields=user_id,username`, { headers: { Authorization: `Bearer ${token}` } });
+      const who = me.user_id;
       if (owner && who !== owner) return withCleared(loginPage("That Instagram account isn't the one this setter runs.", req));
+      // The very first sign-in on a fresh install claims it, so only the account it was set up for (brand.ts) may.
+      if (!owner && (me.username ?? "").toLowerCase() !== IG_HANDLE.toLowerCase()) {
+        return withCleared(loginPage(`This FewChat is set up for @${IG_HANDLE}. Log in with that Instagram account.`, req));
+      }
       await setSetting(env.DB, "ig_token", token); // a fresh 60-day token is a free bonus of logging in
       await setSetting(env.DB, "ig_token_at", String(Date.now()));
-      if (!owner) await setSetting(env.DB, "ig_account_id", who);
+      if (!owner) {
+        // ...and claiming it is connecting it: the same two steps /auth/start takes, so the first button a new owner
+        // sees is enough and their DMs and comments start arriving.
+        await setSetting(env.DB, "ig_account_id", who);
+        await setSetting(env.DB, "ig_user_id", userId);
+        await subscribe(token);
+      }
       const ok = new Response(null, { status: 303, headers: { Location: `${url.origin}/admin/dashboard`, "Set-Cookie": await sessionCookie(env, Date.now()) } });
       return withCleared(ok);
     }

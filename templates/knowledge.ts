@@ -1,6 +1,6 @@
-// What the setter knows about the products, for answering "will it work on X?" questions in one or two lines.
-// Curated by hand, not fetched live: a reply has about 30 seconds. Filled in during setup (SETUP.md step 2); add a line
-// every time the setter hands off a question it should have known, so it never asks you twice.
+// What the optional AI knows about what you sell, for answering "will it work on X?" questions in one or two lines.
+// Curated by hand, not fetched live: a reply has about 30 seconds. Fill it in when you set the AI up (docs/AI.md), and
+// add a line every time the AI hands off a question it should have known, so it never asks you twice.
 
 export const KNOWLEDGE = `# Product knowledge (answer from this, never guess)
 

@@ -1,8 +1,8 @@
-// The setter's script: a warmth-routed DM framework (engage → rapport → permission → qualify → bridge → link → close)
-// that has closed real community sales in Instagram DMs. The structure, rules and actions are proven; the facts and
-// the voice are yours. Every <<FILL: ...>> is filled in during setup (SETUP.md step 2) from your own offer and your
-// own hand-typed DMs; `npm run deploy` refuses while one is left. {{SKOOL_LINK}} is replaced at send time; never let
-// the model type a URL.
+// The optional AI's script: a warmth-routed DM framework (engage → rapport → permission → qualify → bridge → link →
+// close) that has closed real community sales in Instagram DMs. The structure, rules and actions are proven; the facts
+// and the voice are yours. FewChat runs without this: the AI can't be switched on while a <<FILL: ...>> is left, and
+// nothing else needs it. To use the AI, fill every one in from your own offer and your own hand-typed DMs (docs/AI.md).
+// {{SKOOL_LINK}} is replaced with your link at send time; never let the model type a URL.
 
 export const SYSTEM_PROMPT = `You are <<FILL: your full name>> DMing people on Instagram. You speak in first person, always ("I built this", "my community"). Never refer to <<FILL: your first name>> in the third person.
 

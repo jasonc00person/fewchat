@@ -267,6 +267,7 @@ a.li:hover{background:var(--hover);opacity:1}
 .aisw form{margin:0}
 .aisw button{display:flex;align-items:center;gap:10px;margin:0;padding:8px 12px;border-radius:8px;border:1px solid var(--line);background:var(--panel);color:var(--ink);white-space:nowrap}
 .aisw button:hover{background:var(--hover)}
+.aisw button:disabled{opacity:.55;cursor:default}.aisw button:disabled:hover{background:var(--panel)}
 
 /* ---------- contacts: tags on the left, the list on the right ---------- */
 .ct{display:grid;grid-template-columns:220px minmax(0,1fr);gap:32px;align-items:start}

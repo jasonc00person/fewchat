@@ -8,6 +8,7 @@
 #   bash scripts/preview.sh --reset   # rebuild the sample database first
 set -euo pipefail
 cd "$(dirname "$0")/.."
+[ -d node_modules ] || npm install --no-audit --no-fund
 DIR=.wrangler/preview
 DB="$(node -e 'console.log(require("fs").readFileSync("wrangler.jsonc","utf8").match(/"database_name":\s*"([^"]+)"/)[1])')"
 if [ "${1:-}" = "--reset" ] || [ ! -f "$DIR/seeded" ]; then

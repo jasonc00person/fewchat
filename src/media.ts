@@ -49,8 +49,8 @@ export async function transcribe(ai: Ai, url: string): Promise<string | null> {
 const IMAGE_TYPES = ["image/jpeg", "image/png", "image/gif", "image/webp"] as const;
 
 const ASK = {
-  image: "A lead sent this image in an Instagram DM to a creator who teaches AI for content. In one or two short sentences, say what it shows, including any readable text. Description only.",
-  post: "A lead shared this Instagram post in a DM to a creator who teaches AI for content. In one or two short sentences, say what it shows, including any readable text. Description only.",
+  image: "A lead sent this image in an Instagram DM to the owner of this Instagram account. In one or two short sentences, say what it shows, including any readable text. Description only.",
+  post: "A lead shared this Instagram post in a DM to the owner of this Instagram account. In one or two short sentences, say what it shows, including any readable text. Description only.",
   story: "This is the creator's own Instagram story, which a lead just replied to in a DM. In one short sentence, say what it shows, including any readable text. Description only.",
 };
 type Look = keyof typeof ASK;
@@ -91,7 +91,8 @@ async function see(apiKey: string, file: { bytes: ArrayBuffer; type: string }, l
 export async function inspect(env: MediaEnv, url: string, look: Look): Promise<string | null> {
   const file = await download(url);
   if (!file) return null;
-  if (file.type.startsWith("image/")) return see(env.ANTHROPIC_API_KEY, file, look, env.DB && meter(env.DB, "image"));
+  // Reading pictures is Claude's job: without a key they keep their bare [image] label (voice notes still transcribe).
+  if (file.type.startsWith("image/")) return env.ANTHROPIC_API_KEY ? see(env.ANTHROPIC_API_KEY, file, look, env.DB && meter(env.DB, "image")) : null;
   if (file.type.startsWith("video/") || file.type.startsWith("audio/")) return hear(env.AI, file);
   return null;
 }
