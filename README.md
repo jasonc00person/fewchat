@@ -100,7 +100,7 @@ Either way, you can stop at any point. Run it again and it continues where it le
 | Builds every database table | |
 | Makes your passwords and stores them safely | |
 | Puts FewChat live on your own address | |
-| Writes **MY-SETUP.md**: your console address and password, and every Meta click with your values filled in | Follow its 9 steps on Meta's site (about 15 minutes), then paste two values back |
+| Writes **MY-SETUP.md**: your console address and password, and every Meta click with your values filled in | Follow its steps on Meta's site (about 15 minutes; with Claude in Chrome, Claude clicks through them for you), then paste the App secret back |
 | Checks that Instagram can reach your FewChat | Click **Log in with Instagram** on your new console |
 | Waits for your first test message to arrive | Send your account a DM from another account |
 

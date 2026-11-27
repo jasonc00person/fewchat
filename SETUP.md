@@ -2,7 +2,7 @@
 
 **If you're a person:** you don't need this page. Run `npm run setup` and follow it. The README has the short version.
 
-**If you're Claude (or another coding agent):** the user said "set this up". This page is your runbook. Assume they have never used a terminal: explain each step in a sentence of plain words before you do it, do everything you can yourself, and only hand them what needs their hands (signing in, clicking in Meta's dashboard, pasting a secret into `.env`). One thing at a time. Tick steps off in chat as they land.
+**If you're Claude (or another coding agent):** the user said "set this up". This page is your runbook. Assume they have never used a terminal: explain each step in a sentence of plain words before you do it, do everything you can yourself, and only hand them what needs their hands (signing in, codes and terms Meta asks them for, pasting a secret into `.env`, approving access to their account). With a browser tool you do Meta's dashboard clicks too (section 3). One thing at a time. Tick steps off in chat as they land.
 
 ## Rules
 
@@ -47,9 +47,20 @@ If it pauses earlier:
 - **A Worker with this name already exists**: ask whether it's an old FewChat of theirs. If not, run again with `--name=fewchat-2`.
 - **Anything about their plan**: Workers Paid, $5 a month, at dash.cloudflare.com → Workers & Pages → Plans.
 
-## 3. The Meta app (the user clicks, you guide)
+## 3. The Meta app (you click when you can, they sign in)
 
-Tell the user to open `MY-SETUP.md` in this folder: it has the 9 steps with their own addresses already filled in, to copy and paste. Walk them through one step at a time and wait for "done" after each. Their address is the `url` in `fewchat.config.json`, if you need to refer to it.
+**Do the clicks yourself when you can.** If you have a browser tool that acts in the user's own browser (Claude in Chrome, or computer use), do the steps below in it yourself, in their signed-in browser: create the app, the configuration, the redirect, the permissions, the App settings, Publish. Hand over only what's theirs:
+
+- **Logging in** to Facebook, and any password Meta asks for on the way (it re-asks when an app is created). Never type a password.
+- **Registering as a Meta developer** (step 1): Meta sends codes to their phone or email and asks them to accept its terms.
+- **Creating a business portfolio** if they have none (step 2): their name and business email.
+- **Adding their Instagram account to the portfolio** if it isn't there (step 3): it asks for their Instagram login.
+- **The App secret**: they paste it into `.env` after `META_APP_SECRET=` (you run setup, so nothing prompts them; if they run `npm run setup` in their own terminal, it asks with the input hidden). Don't read it off the page yourself. The App ID and Configuration ID aren't secret: read them and pass them as `--app-id` / `--config-id`.
+- **Meta's final sharing screen** (business portfolio, Page, Instagram account, Confirm) when they log in to FewChat: it grants access to their account, so they click it, or you do only after they've said yes to exactly that.
+
+You don't set the webhook: `npm run setup` sets it through Meta's API once it has the App ID and secret (Unified login apps), after waiting for the new address to answer. If Meta ever refuses, run setup again; if it keeps refusing, the user sets it by hand (API setup with Unified login → 3. Configure webhooks) and copies the verify token themselves from the `META_VERIFY_TOKEN=` line in `.env` (don't repeat it in chat). On an older Instagram-login app the webhook is step 5 and the verify token is in `MY-SETUP.md`: the user copies it from there.
+
+Without a browser tool: tell the user to open `MY-SETUP.md` in this folder. It has the steps with their own addresses already filled in, to copy and paste. Walk them through one step at a time and wait for "done" after each. Their address is the `url` in `fewchat.config.json`, if you need to refer to it.
 
 **Two kinds of Meta app.** Every app created since late October 2026 only offers **API setup with Unified login**: that's the default, and the steps below. An older app that still shows **API setup with Instagram login** uses the older steps: run `npm run setup -- --login=instagram` and `MY-SETUP.md` is rewritten with those (their numbers differ from these). `login` in `fewchat.config.json` says which one an install uses.
 
@@ -62,8 +73,9 @@ The steps (Unified login), so you can answer questions (in every address, `<url>
 5. **Register a new redirect URL** on the same page: `<url>/auth/callback`, Save.
 6. **Use cases → Customize → Permissions and features**: **Add** `business_management` and `pages_show_list`. The configuration only offers permissions the use case has.
 7. **Facebook Login for Business → Configurations → Edit**: assets **Pages** on, **Ad accounts** off; permissions `business_management`, `pages_show_list`, `instagram_basic`, `instagram_manage_messages`, `instagram_manage_comments` (ads and content_publish off). Save.
-8. **3. Configure webhooks** on the Unified login page: callback URL `<url>/meta`, verify token from `MY-SETUP.md`. Verify and save, then switch on `comments`, `live_comments`, `message_edit`, `message_reactions`, `messages`, `messaging_postbacks`, `messaging_referral`, `messaging_seen`.
-9. **App settings → Basic**: app domain (the address without `https://`), privacy `<url>/privacy`, terms `<url>/terms`, data deletion `<url>/data-deletion`, a category; note the **App ID** and **App secret**. Then **Publish** in the left menu → **Publish**. No icon, App Review or tester role needed.
+8. **App settings → Basic**: app domain (the address without `https://`), privacy `<url>/privacy`, terms `<url>/terms`, data deletion `<url>/data-deletion`, a category; note the **App ID** and **App secret**. Then **Publish** in the left menu → **Publish**. No icon, App Review or tester role needed. (These settings can't be set through the API unless the app owner turns that on under App settings → Advanced, so they stay a click step.)
+
+The webhook isn't a step: setup sets it (`connectWebhook` in `scripts/setup.mjs`, `POST /<app id>/subscriptions` with the app's own token), and `npm run check` confirms it points at their address. If Meta refuses, setup prints the manual way (API setup with Unified login → 3. Configure webhooks).
 
 **The Page is what makes DMs arrive.** At login Meta asks for a business portfolio, a Page (marked optional) and the Instagram account. If the Instagram account is linked to a Facebook Page (Business settings → Instagram accounts → the account → Connected assets) and that Page isn't shared, comments still arrive by webhook but DMs never do (Meta documents this as a temporary limitation; confirmed live 2026-11-27). FewChat's missed-DM sync still records them within a minute, so nothing is lost, but automations and the AI answer late. Fix: log in again (`<url>/auth/start`) and share the Page.
 
@@ -112,7 +124,7 @@ Every line should have a ✓ except "Nothing has ever arrived from Instagram", w
 
 From a **second** Instagram account (a friend's or a spare; a message to yourself doesn't count):
 
-1. **A DM.** Send the account a DM. It should be in the console's Inbox within seconds, and `npm run check` now shows Instagram's last delivery. Nothing arriving means step 9 (not published) or step 8 (webhook) in almost every case. Arriving only after a minute or so (the sync, not the webhook) on a Unified login app means the linked Facebook Page wasn't shared at login: log in again at `<url>/auth/start` and pick it.
+1. **A DM.** Send the account a DM. It should be in the console's Inbox within seconds, and `npm run check` now shows Instagram's last delivery. Nothing arriving means the app isn't published (step 8; older apps 9) or the webhook isn't set (`npm run check` says; `npm run setup` sets it again) in almost every case. Arriving only after a minute or so (the sync, not the webhook) on a Unified login app means the linked Facebook Page wasn't shared at login: log in again at `<url>/auth/start` and pick it.
 2. **A comment automation.** In the console: Automation → New Automation → the template **Comment keyword → DM link** → pick a post, a test keyword and their link → **Publish**. Comment the keyword from the second account: the DM arrives within seconds.
 
 Done = both worked. Show them where things are: the console address, `MY-SETUP.md`, `npm run check`, `npm run update`.

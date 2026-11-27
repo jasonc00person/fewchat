@@ -502,6 +502,9 @@ const ago = (ms) => {
 // ------------------------------------------------------------------------------------- your own page of instructions
 
 const WEBHOOK_FIELDS = ["messages", "messaging_postbacks", "messaging_seen", "messaging_referral", "message_reactions", "message_edit", "comments", "live_comments"];
+// Where MY-SETUP.md covers publishing the app, and what to do about a webhook that isn't set: the two usual causes.
+const notLive = (c) => (c.login === "unified" ? "step 8" : "step 9");
+const noHook = (c) => (c.login === "unified" ? "its webhook isn't set (`npm run setup` sets it again)" : "its webhook wasn't saved (step 5)");
 function metaSteps(c) {
   const host = c.url.replace(/^https:\/\//, "");
   const webhook = `   - Callback URL: \`${c.url}/meta\`\n   - Verify token: \`${readEnv().META_VERIFY_TOKEN ?? "(in .env: META_VERIFY_TOKEN)"}\`\n   - Fields: ${WEBHOOK_FIELDS.map((f) => `\`${f}\``).join(", ")}`;
@@ -517,8 +520,7 @@ function metaSteps(c) {
       `5. Under **Register a new redirect URL** on the same page, paste \`${c.url}/auth/callback\` and click **Save**.`,
       `6. In the left menu open **Use cases**, then **Customize**, then **Permissions and features**. Find \`business_management\` and click **Add** (without it the login works but FewChat can't see your account), then do the same for \`pages_show_list\`.`,
       `7. In the left menu open **Facebook Login for Business → Configurations**, click **Edit** on the configuration, and click **Next** to the end:\n   - Assets: tick **Pages** and untick **Ad accounts**. (When you log in, you'll share the Facebook Page your Instagram is linked to: without it Instagram sends FewChat your comments but **not your DMs**. No linked Page? Just leave the Page empty then.)\n   - Permissions: tick \`business_management\` and \`pages_show_list\`; keep \`instagram_basic\`, \`instagram_manage_messages\` and \`instagram_manage_comments\`; untick the ads ones and \`instagram_content_publish\`. **Save**.`,
-      `8. Back on **API setup with Unified login**, open **3. Configure webhooks**, paste these two and click **Verify and save**, then switch on every field in the list below:\n${webhook}`,
-      `9. In the left menu open **App settings → Basic** and fill in, then **Save changes**:\n${basic}\n   At the top of that page are the **App ID** and the **App secret** (click Show). Setup asks for both at the end. Then click **Publish** in the left menu and **Publish** again. (No App Review: your own account is enough.)`,
+      `8. In the left menu open **App settings → Basic** and fill in, then **Save changes**:\n${basic}\n   At the top of that page are the **App ID** and the **App secret** (click Show). Setup asks for both at the end. Then click **Publish** in the left menu and **Publish** again. (No App Review: your own account is enough.)\n\n   The webhook (where Instagram sends your DMs and comments) isn't a step: setup sets it on your app by itself once it has the App ID and secret.`,
     ];
   }
   return [
@@ -550,6 +552,9 @@ It is rewritten every time you run \`npm run setup\`.
 
 Instagram only lets an app send DMs for you if you register that app with Meta. It's free, and yours alone.
 Paste the values exactly as they are here.
+
+**Using Claude Code with a browser (Claude in Chrome)?** Say "do the Meta steps for me": it clicks through all of these in
+your browser. You only log in when Meta asks for your password, and paste the App secret into the terminal yourself.
 
 ${metaSteps(c).join("\n\n")}
 
@@ -612,19 +617,21 @@ async function metaApp(c) {
   const env = readEnv();
   const unified = c.login === "unified";
   if (c.instagram_app_id && env.META_APP_SECRET && (!unified || c.login_config_id)) return true;
+  const n = metaSteps(c).length;
   say("  Instagram only lets an app send DMs for you if you register that app with Meta. It's free and takes about 15 minutes.");
-  say(`  Every click, with your own addresses already filled in, is in ${bold("MY-SETUP.md")} in this folder. Open it and follow the 9 steps.`);
+  say(`  Every click, with your own addresses already filled in, is in ${bold("MY-SETUP.md")} in this folder. Open it and follow the ${n} steps.`);
+  say(dim("  Using Claude Code with a browser (Claude in Chrome)? Ask it to do these steps for you: you only log in when Meta asks."));
   say();
   if (!TTY) {
     throw waitFor([
-      "Waiting on the Meta app. When the 9 steps in MY-SETUP.md are done:",
+      `Waiting on the Meta app. When the ${n} steps in MY-SETUP.md are done:`,
       ...(unified
         ? ["  1. Put the App secret (App settings → Basic) in .env on the line META_APP_SECRET=  (never in chat)", "  2. Run: npm run setup -- --app-id=<the App ID> --config-id=<the Configuration ID>"]
         : ["  1. Put the Instagram app secret in .env on the line META_APP_SECRET=  (never in chat)", "  2. Run: npm run setup -- --app-id=<the Instagram app ID>"]),
     ]);
   }
   openInBrowser("https://developers.facebook.com/apps");
-  const ready = await ask("Type " + bold("done") + " when you've finished the 9 steps, or " + bold("later") + " to stop here and come back.", { check: (v) => (/^(done|later)$/i.test(v) ? null : "Type done or later.") });
+  const ready = await ask("Type " + bold("done") + ` when you've finished the ${n} steps, or ` + bold("later") + " to stop here and come back.", { check: (v) => (/^(done|later)$/i.test(v) ? null : "Type done or later.") });
   if (/later/i.test(ready)) throw waitFor(["No problem. When the Meta app is done, run `npm run setup` again: it continues from here."]);
   const id = unified ? "App ID" : "Instagram app ID", secretName = unified ? "App secret" : "Instagram app secret";
   if (!c.instagram_app_id) c.instagram_app_id = await ask("Paste the " + bold(id) + " (a long number).", { check: (v) => (/^\d{8,20}$/.test(v) ? null : `The ${id} is only digits. It's on ${unified ? "App settings → Basic" : "Instagram → API setup with Instagram login"}.`) });
@@ -639,6 +646,41 @@ async function metaApp(c) {
   return true;
 }
 
+// Unified login: the webhook is set through Meta's API with the app's own token (App ID|App secret), so nobody pastes a
+// callback URL and verify token or flips 8 switches. Meta calls the Worker to check the verify token, so it has to be live.
+// Older Instagram-login apps set it on their own page (MY-SETUP.md).
+async function graphApp(c, method, path, params = {}) {
+  const env = readEnv();
+  const body = new URLSearchParams({ ...params, access_token: `${c.instagram_app_id}|${env.META_APP_SECRET}` });
+  const url = `https://graph.facebook.com/v26.0${path}`;
+  try {
+    const res = await fetch(method === "GET" ? `${url}?${body}` : url, { method, ...(method === "GET" ? {} : { body }), signal: AbortSignal.timeout(20_000) });
+    return await res.json();
+  } catch (e) {
+    return { error: { message: e.message } };
+  }
+}
+const webhookSet = (subs) => {
+  const ig = (subs?.data ?? []).find((s) => s.object === "instagram");
+  const fields = (ig?.fields ?? []).map((f) => f.name);
+  return Boolean(ig?.active && fields.includes("messages") && fields.includes("comments"));
+};
+async function connectWebhook(c) {
+  if (c.login !== "unified") return;
+  // Meta checks the address the moment it's set, and a brand-new workers.dev address can take a few minutes to answer
+  // (webhookAnswers already retries for about half a minute).
+  if (!(await webhookAnswers(c))) return warn("Your FewChat address isn't answering yet, so the webhook can't be set. Run `npm run setup` again in a few minutes: it picks up here.");
+  const verifyToken = readEnv().META_VERIFY_TOKEN ?? "";
+  const res = await graphApp(c, "POST", `/${c.instagram_app_id}/subscriptions`, { object: "instagram", callback_url: `${c.url}/meta`, verify_token: verifyToken, fields: WEBHOOK_FIELDS.join(",") });
+  if (!res.success) {
+    warn(`Meta didn't take the webhook (${res.error?.message ?? "no answer"}). Run \`npm run setup\` again: it's safe. If it keeps refusing, set it by hand once:`);
+    return info(`API setup with Unified login → 3. Configure webhooks: callback ${c.url}/meta, verify token ${verifyToken}, Verify and save, then switch on ${WEBHOOK_FIELDS.join(", ")}.`);
+  }
+  const back = await graphApp(c, "GET", `/${c.instagram_app_id}/subscriptions`);
+  if (webhookSet(back)) return ok("Webhook set on your Meta app (your DMs and comments come here)");
+  warn(`Meta took the webhook but didn't show it back (${back.error?.message ?? "fields missing"}). Run \`npm run check\` in a minute.`);
+}
+
 async function connectInstagram(c) {
   let s = settings(c);
   if (!s?.ig_token) {
@@ -648,7 +690,7 @@ async function connectInstagram(c) {
     openInBrowser(`${c.url}/login`);
     await enter("When Instagram is connected, come back here.");
     s = settings(c);
-    if (!s?.ig_token) throw waitFor(["Instagram isn't connected yet.", `Open ${c.url}/login, click Log in with Instagram, then run \`npm run check\`. If Instagram shows an error there, step 6 or 8 in MY-SETUP.md is the usual cause.`]);
+    if (!s?.ig_token) throw waitFor(["Instagram isn't connected yet.", `Open ${c.url}/login, click Log in with Instagram, then run \`npm run check\`. If Instagram shows an error there, ${c.login === "unified" ? "step 5 or 7" : "step 6 or 8"} in MY-SETUP.md is the usual cause.`]);
   }
   const me = await instagram(c, s, "/me?fields=username");
   ok(`Instagram is connected${me?.username ? ` as @${me.username}` : ""}`);
@@ -660,7 +702,7 @@ async function connectInstagram(c) {
     if (settings(c)?.webhook_at) return ok("It arrived. Open the Inbox in your console: the message is there.");
     await new Promise((res) => setTimeout(res, 5000));
   }
-  warn("Nothing arrived in the last minute. The usual causes: the Meta app isn't Live (step 9), or the webhook wasn't saved (step 5).");
+  warn(`Nothing arrived in the last minute. The usual causes: the Meta app isn't published (${notLive(c)}), or ${noHook(c)}.`);
   info("Fix that in MY-SETUP.md, send another DM, then run `npm run check`.");
 }
 
@@ -744,6 +786,7 @@ async function setup() {
   await deploy(c, "final deploy");
   writeSheet(c);
   ok("Meta app connected to FewChat");
+  await connectWebhook(c);
 
   step("Connect your Instagram account");
   await connectInstagram(c);
@@ -806,6 +849,15 @@ async function check() {
   else if (pending.length) no(`The database is ${pending.length} change${pending.length === 1 ? "" : "s"} behind this folder`, "Run `npm run update`.");
   else ok("Database is up to date");
 
+  // The Meta app's webhook needs only the app's own id and secret, so it's checked before Instagram is connected too.
+  if (c.login === "unified" && c.instagram_app_id && env.META_APP_SECRET) {
+    const hook = await graphApp(c, "GET", `/${c.instagram_app_id}/subscriptions`);
+    const mine = (hook?.data ?? []).find((x) => x.object === "instagram")?.callback_url === `${c.url}/meta`;
+    if (webhookSet(hook) && mine) ok("The Meta app's webhook points here");
+    else if (hook?.error) no(`Couldn't read the Meta app's webhook (${hook.error.message})`, "Check the App ID in fewchat.config.json and the App secret in .env, then run `npm run check` again.");
+    else no("The Meta app's webhook isn't set to this address", "Run `npm run setup`: it sets it again.");
+  }
+
   const s = settings(c);
   if (!s?.ig_token) {
     no("Instagram isn't connected", `Open ${c.url}/login on a computer and click Log in with Instagram.`);
@@ -821,7 +873,7 @@ async function check() {
   else if (subs) no("Instagram isn't set to send your DMs and comments here", `Open ${c.url}/auth/start and approve again: that switches them on.`);
 
   if (!s.webhook_at) {
-    no("Nothing has ever arrived from Instagram", "Send your account a DM from another account. Still nothing? The Meta app isn't Live (step 9 in MY-SETUP.md) or its webhook wasn't saved (step 5).");
+    no("Nothing has ever arrived from Instagram", `Send your account a DM from another account. Still nothing? The Meta app isn't published (${notLive(c)} in MY-SETUP.md), or ${noHook(c)}.`);
   } else if (Date.now() - Number(s.webhook_at) > 24 * 3600_000) {
     warn(`Nothing has arrived from Instagram since ${ago(Number(s.webhook_at))}`);
     info("Fine on a quiet account. If people did message you, check the Meta app is still Live and its webhook still points at your address.");

@@ -29,7 +29,7 @@ These are the steps in `MY-SETUP.md`. The step number is where to look.
 
 | Problem | Usual cause |
 | --- | --- |
-| Meta says the callback URL or verify token couldn't be validated | A stray space, or the wrong value pasted. Copy both again from step 8 (step 5 on an older Instagram-login app). Run `npm run check`: if "Answers Instagram's webhook check" has a ✓, your side is fine. |
+| Meta says the callback URL or verify token couldn't be validated | On a new (Unified login) app, setup sets the webhook itself: run `npm run setup` again. On an older Instagram-login app it's step 5: a stray space or the wrong value pasted, so copy both again. Run `npm run check`: if "Answers Instagram's webhook check" has a ✓, your side is fine. |
 | An error about the redirect URI when you log in | Step 5 (older apps: step 6): the redirect URL has to match exactly, ending in `/auth/callback`. |
 | An error about your developer role, or not being a tester | Older Instagram-login apps, step 8: add your Instagram account as an Instagram tester, **and** accept the invite inside Instagram. Both halves are needed. |
 | The **Business login settings** button does nothing | Open (unfold) that section of the page first, then click it. |
@@ -43,8 +43,8 @@ These are the steps in `MY-SETUP.md`. The step number is where to look.
 
 `npm run check` says "Nothing has ever arrived from Instagram", or your Inbox stays empty.
 
-1. **Is the Meta app published (Live)?** Step 9. Until then, Instagram only delivers messages from accounts that have a role on your app.
-2. **Was the webhook saved, with the fields switched on?** Step 8 (older apps: step 5). The fields are separate switches under the callback URL.
+1. **Is the Meta app published (Live)?** Step 8 (older apps: step 9). Until then, Instagram only delivers messages from accounts that have a role on your app.
+2. **Is the webhook set?** `npm run check` says ("The Meta app's webhook points here"); on a new app `npm run setup` sets it again. Older apps: step 5, where the fields are separate switches under the callback URL.
 3. **Comments arrive but DMs only show up a minute late (or not at all)?** On a Unified login app this is Meta's own limitation when your Instagram account is linked to a Facebook Page and the Page wasn't shared at login. Open `<your address>/auth/start` and, when Meta asks, pick that Page as well as your Instagram account (steps 6 and 7 add the Page option if your configuration doesn't have it yet). Business settings → Instagram accounts → your account → Connected assets shows which Page it is.
 4. **Is Instagram connected?** Logging in with Instagram the first time is what tells Instagram to send this account's messages to your FewChat. If in doubt, open `<your address>/auth/start` and approve again. It's harmless.
 4. **Test from a different account.** A message you send to yourself doesn't count.
