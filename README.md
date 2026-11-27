@@ -141,6 +141,30 @@ These files are yours. Git ignores them, so updates never overwrite them and the
 | `MY-SETUP.md` | Your console address, your password and your Meta steps. Never share it. |
 | `src/prompt.ts`, `src/knowledge.ts` | The AI's script, if you turn the AI on |
 
+## Getting updates
+
+```bash
+npm run update
+```
+
+This gets the newest FewChat, applies any database changes it brings and puts the new version live. The files above are never touched.
+
+**Forked it on GitHub?** Your folder gets its updates from your fork, not from this repo. Open your fork on GitHub and click **Sync fork** first, then run `npm run update`. If you haven't synced, `npm run update` just says "Already up to date".
+
+**Changed FewChat's code yourself?** When an update changes a file you edited, `npm run update` stops before changing anything. You'll see "Not possible to fast-forward" or "Your local changes would be overwritten". Your live FewChat keeps running the version you have. To combine your changes with the update:
+
+```bash
+git add -A && git commit -m "My changes"
+```
+
+```bash
+git pull --no-rebase
+```
+
+Then run `npm run update` again. Git combines the two by itself and only stops at the lines that both you and the update changed, so you can pick what stays. With Claude Code or another AI agent, just ask it to "merge the latest FewChat update and keep my changes".
+
+**The AI's script stays yours.** `src/prompt.ts` and `src/knowledge.ts` were copied from `templates/` when you set up, so updates never change them. When `templates/prompt.ts` gets better, compare it with your copy and bring over what you want.
+
 ## Questions
 
 **Do I need to code?** No. Setup is one command, and automations are built by clicking in the console.

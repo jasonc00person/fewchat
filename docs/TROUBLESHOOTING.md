@@ -74,6 +74,14 @@ These are the steps in `MY-SETUP.md`. The step number is where to look.
 
 On Cloudflare's free plan the database can only be read so much per day. A busy inbox uses it up, and then the console, your automations and incoming messages all pause until midnight UTC. Nothing is lost: missed comments and messages are picked up afterwards. The lasting fix is Workers Paid ($5 a month): dash.cloudflare.com → Workers & Pages → Plans.
 
+## Updating
+
+| What you see | What to do |
+| --- | --- |
+| "Not possible to fast-forward" or "Your local changes would be overwritten" | You changed FewChat's code, and the update changes the same files. Nothing was changed and your live FewChat still runs. Commit your changes (`git add -A && git commit -m "My changes"`), run `git pull --no-rebase`, then `npm run update` again. Details in README.md under "Getting updates". |
+| "Already up to date", but you know there's a newer version | Your folder is a copy of a GitHub fork. Click **Sync fork** on your fork's GitHub page, then run `npm run update`. |
+| "CONFLICT" after `git pull --no-rebase` | You and the update changed the same lines. Git marks each spot in the file between `<<<<<<<` and `>>>>>>>`. Keep what you want, delete the markers, then `git add -A && git commit`. Or ask your AI agent to finish the merge and keep your changes. |
+
 ## Watching it live
 
 ```bash
