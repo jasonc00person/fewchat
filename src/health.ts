@@ -39,12 +39,23 @@ export async function logError(d1: D1Database, kind: string, ref: string | null,
     .catch((err) => console.error("errors insert:", err));
 }
 
+// What Cloudflare's database answers while it restarts (it resets itself when one query runs out of CPU, e.g. a heavy
+// lookup). Work that fails this way is picked up again by the cron, not dropped.
+export const DB_BLIP = /D1_ERROR|Network connection lost|object to be reset|overloaded/i;
+
 export type Problem = { kind: string; n: number; last_at: number; detail: string | null };
 
-// Everything that failed to deliver since `since`, one row per kind, newest first. A comment DM that failed also leaves a
-// failed flow_sends row for the same person; those are counted once, as the comment DM.
+// Everything that failed to deliver since `since`, one row per kind, newest first. Every try at a comment DM leaves a
+// failed flow_sends row for that person and automation. A failure before anything from that automation had reached a
+// commenter is one of those tries: it's counted with the comment (failed, or still waiting to retry), or not at all
+// once a retry got through. A message that fails after an earlier one reached them is a flow message.
 const notComment = (f: string) =>
-  `NOT EXISTS (SELECT 1 FROM comments c WHERE c.status = 'failed' AND c.trigger_id = ${f}.trigger_id AND c.subscriber_id = ${f}.subscriber_id)`;
+  `(NOT EXISTS (SELECT 1 FROM comments c WHERE c.trigger_id = ${f}.trigger_id AND c.subscriber_id = ${f}.subscriber_id)
+    OR EXISTS (SELECT 1 FROM flow_sends s WHERE s.status = 'sent' AND s.trigger_id = ${f}.trigger_id AND s.subscriber_id = ${f}.subscriber_id AND s.id < ${f}.id))`;
+
+const WAITING = "comment DM waiting to retry";
+// Instagram's wording when it's refusing new conversations (see comments.ts): reads as broken, so say what it means.
+const CAPPED = "Instagram is limiting new conversations for now. These retry by themselves once it eases off, and each commenter gets a public reply asking them to DM the keyword.";
 
 export async function recentProblems(d1: D1Database, since: number): Promise<Problem[]> {
   const { results } = await d1
@@ -55,6 +66,9 @@ export async function recentProblems(d1: D1Database, since: number): Promise<Pro
        SELECT 'comment DM', COUNT(*), MAX(created_at), (SELECT error FROM comments WHERE status = 'failed' AND created_at > ?1 ORDER BY created_at DESC LIMIT 1)
          FROM comments WHERE status = 'failed' AND created_at > ?1 HAVING COUNT(*) > 0
        UNION ALL
+       SELECT ?2, COUNT(*), MAX(created_at), (SELECT error FROM comments WHERE status = 'queued' AND error IS NOT NULL ORDER BY created_at DESC LIMIT 1)
+         FROM comments WHERE status = 'queued' AND error IS NOT NULL HAVING COUNT(*) > 0
+       UNION ALL
        SELECT 'flow message', COUNT(*), MAX(f.created_at), (SELECT error FROM flow_sends g WHERE g.status = 'failed' AND g.created_at > ?1 AND ${notComment("g")} ORDER BY g.created_at DESC, g.id DESC LIMIT 1)
          FROM flow_sends f WHERE f.status = 'failed' AND f.created_at > ?1 AND ${notComment("f")}
          HAVING COUNT(*) > 0
@@ -63,9 +77,9 @@ export async function recentProblems(d1: D1Database, since: number): Promise<Pro
          FROM drafts WHERE status = 'failed' AND created_at > ?1 HAVING COUNT(*) > 0
        ORDER BY last_at DESC`,
     )
-    .bind(since)
+    .bind(since, WAITING)
     .all<Problem>();
-  return results;
+  return results.map((p) => (p.kind === WAITING && /thread does not exist/i.test(p.detail ?? "") ? { ...p, detail: CAPPED } : p));
 }
 
 // Leads who spoke last 30+ min ago (inside the 24h window) with no draft. With the AI on these mean the setter is broken;

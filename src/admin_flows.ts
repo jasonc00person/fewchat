@@ -6,11 +6,12 @@
 // change anything.
 
 import { esc, page, type Role } from "./admin";
+import type { Broadcast } from "./broadcast";
 import { NEXT_POST, type Trigger } from "./comments";
 import * as db from "./db";
 import { EDITOR_CSS, EDITOR_JS } from "./flow_editor";
 import { saveIceBreakers, saveMenu, testCode } from "./flows";
-import { editorGraph, graphStats, loadGraph, publish, sanitize, STAGES, triggerCfg, validate, type Graph, type Node } from "./graph";
+import { dmKeywordOwner, dmWords, editorGraph, graphStats, loadGraph, publish, sanitize, STAGES, triggerCfg, triggersOf, validate, type Graph, type Node } from "./graph";
 import { fetchAccount, recentMedia, recentStories, type Media, type Story } from "./meta";
 import type { Env } from "./setter";
 import { icon } from "./theme";
@@ -55,6 +56,10 @@ const CSS = `<style>
 .au-row .nm{color:var(--ink);font-size:16px;line-height:20px;font-weight:600;opacity:1;display:flex;align-items:center;min-width:0}.au-row .nm span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .au-row .nm:hover span:last-child{color:var(--pri)}
 .au-row .trg{font-size:12px;line-height:20px;color:var(--mut);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.au-row .bc{grid-column:2/-1;margin-left:-10px;display:flex;align-items:center;gap:8px;font-size:12px;line-height:20px;color:var(--mut);min-width:0}
+.au-row .bc b{flex:none;font-weight:600;font-size:11px;letter-spacing:.02em;text-transform:uppercase;padding:0 8px;border-radius:999px;background:var(--soft);color:var(--mut)}
+.au-row .bc.running b{background:color-mix(in srgb,var(--green) 18%,transparent);color:var(--green)}.au-row .bc.scheduled b{background:color-mix(in srgb,var(--pri) 14%,transparent);color:var(--pri)}
+.au-row .bc span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .mc-num{font-weight:500;text-align:right;font-variant-numeric:tabular-nums}.au-row .mod{color:var(--mut);white-space:nowrap}
 .au-row .sub{font-size:12px;line-height:16px;color:var(--mut);text-align:right;font-variant-numeric:tabular-nums}
 .au-row .sw{display:grid;place-items:center}
@@ -148,6 +153,25 @@ export function triggerLine(t: Pick<Trigger, "source" | "keyword" | "media_id">,
 
 const pct = (n: number, of: number) => (of ? `${((100 * n) / of).toFixed(1)}%` : "n/a");
 
+// The broadcast's state under the card's trigger lines: sending, scheduled (with the start in the viewer's time),
+// paused or finished, with how many it has sent, its cap and why it stopped.
+function broadcastLine(b: Broadcast | undefined, sent: number, now: number): string {
+  if (!b) return "";
+  const n = (x: number) => x.toLocaleString("en-US");
+  const scheduled = b.status === "running" && b.start_at && b.start_at > now;
+  const state = scheduled ? "scheduled" : b.status;
+  const label = { scheduled: "Broadcast scheduled", running: "Broadcast sending", paused: "Broadcast paused", done: "Broadcast finished" }[state] ?? "Broadcast";
+  const parts = [
+    scheduled ? `starts <time data-t="${b.start_at}"></time>` : "",
+    `${n(sent)} sent of ${n(b.cap)}`,
+    b.status === "running" ? `${n(b.per_min)} a minute` : "",
+    b.status !== "done" && b.left != null ? `${n(b.left)} reachable now` : "",
+    // The cap note's "(N more inside the window right now)" was true when it stopped; the live count is above.
+    b.note ? esc(b.note.replace(/\s*\([^)]*right now\)$/, "")) : "",
+  ].filter(Boolean);
+  return `<span class="sp"></span><div class="bc ${state}"><b>${label}</b><span>${parts.join(" · ")}</span></div>`;
+}
+
 function ago(ms: number | null, now: number): string {
   if (!ms) return "";
   const s = Math.max(0, (now - ms) / 1000);
@@ -166,6 +190,7 @@ export const nameOf = (t: Trigger) => t.name || DEFAULT_NAME[t.source] || t.keyw
 interface Stats {
   runs: number;
   clicks: number;
+  via?: Map<string, { runs: number; clicks: number }>; // per trigger of the When... card ("main" or an extra's id)
 }
 
 // Runs = people who entered the automation; CTR = share of them who tapped or clicked anything in it. Comment
@@ -182,6 +207,22 @@ async function automationStats(env: Env): Promise<Map<number, Stats>> {
   const get = (id: number) => out.get(id) ?? out.set(id, { runs: 0, clicks: 0 }).get(id)!;
   for (const c of clicks) get(c.trigger_id).clicks = c.n;
   for (const c of comments) get(c.trigger_id).runs = Math.max(get(c.trigger_id).runs, c.runs);
+  // Per trigger, for automations with more than one: runs by flow_starts.via, clicks by the person's run. Runs from
+  // before via existed, or started by a button or another automation, count under the main trigger.
+  const { results: vruns } = await env.DB.prepare(
+    `SELECT trigger_id, COALESCE(via, 'main') AS via, COUNT(*) AS n FROM flow_starts WHERE status = 'sent' AND trigger_id IN (SELECT id FROM triggers WHERE more IS NOT NULL) GROUP BY 1, 2`,
+  ).all<{ trigger_id: number; via: string; n: number }>();
+  const { results: vclicks } = await env.DB.prepare(
+    `SELECT s.trigger_id, COALESCE(f.via, 'main') AS via, COUNT(DISTINCT s.subscriber_id) AS n FROM flow_taps t JOIN flow_sends s ON s.id = t.send_id
+       LEFT JOIN flow_starts f ON f.trigger_id = s.trigger_id AND f.subscriber_id = s.subscriber_id
+     WHERE s.trigger_id IN (SELECT id FROM triggers WHERE more IS NOT NULL) GROUP BY 1, 2`,
+  ).all<{ trigger_id: number; via: string; n: number }>();
+  const slot = (id: number, via: string) => {
+    const v = (get(id).via ??= new Map());
+    return v.get(via) ?? v.set(via, { runs: 0, clicks: 0 }).get(via)!;
+  };
+  for (const r of vruns) slot(r.trigger_id, r.via).runs = r.n;
+  for (const r of vclicks) slot(r.trigger_id, r.via).clicks = r.n;
   return out;
 }
 
@@ -212,6 +253,7 @@ const act = (id: string, x: number, y: number, actions: { type: string; value: s
 const TRIG: Node = { id: "trigger", kind: "trigger", x: 0, y: 0, data: {} };
 const tg = (source: Trigger["source"], keyword: string, nodes: Node[], edges: [string, string, string][], public_reply: string | null = null): Graph => ({
   trigger: { source, keyword, media_id: null, public_reply },
+  more: [],
   nodes: [TRIG, ...nodes],
   edges: edges.map(([from, port, to]) => ({ from, port, to })),
 });
@@ -315,6 +357,9 @@ export const TEMPLATES: Record<string, { name: string; emoji: string; desc: stri
 
 // A new automation: a DRAFT (off) whose draft is the template. The live graph is just the When... node, so the old
 // builder's conversion never touches it.
+const dmClash = (o: { t: Trigger; word: string }) =>
+  `When...: "${nameOf(o.t)}" already answers the DM keyword ${o.word.toUpperCase()}. A DM keyword can start only one automation, so take it off that one first.`;
+
 // The live automation already waiting for the next post, if any other than `id`.
 const waitingForNextPost = (env: Env, id: number) =>
   env.DB.prepare(`SELECT * FROM triggers WHERE id != ?1 AND source = 'comment' AND media_id = ?2 AND enabled = 1 AND deleted_at IS NULL LIMIT 1`).bind(id, NEXT_POST).first<Trigger>();
@@ -372,9 +417,20 @@ async function listTab(env: Env, u: URLSearchParams, who: Role, label: Map<strin
   const { results: all } = await env.DB.prepare(`SELECT * FROM triggers WHERE deleted_at IS NULL`).all<Trigger>();
   const stats = await automationStats(env);
   const st = (t: Trigger) => stats.get(t.id) ?? { runs: 0, clicks: 0 };
+  // A broadcast (src/broadcast.ts) sends its automation to a list; its own pause is separate from the card's switch,
+  // which only says whether the automation can run (and its buttons keep working). So the card says both.
+  const { results: bcRows } = await env.DB.prepare(`SELECT key, value FROM settings WHERE key LIKE 'broadcast:%'`).all<{ key: string; value: string }>();
+  const broadcasts = new Map<number, Broadcast>();
+  for (const r of bcRows) {
+    try {
+      broadcasts.set(Number(r.key.slice(10)), JSON.parse(r.value) as Broadcast);
+    } catch {
+      /* a broken setting shows nothing */
+    }
+  }
   // Search covers every folder; otherwise you see the open folder.
-  let list = all.filter((t) => (q ? `${nameOf(t)} ${t.keyword}`.toLowerCase().includes(q) : (t.folder ?? null) === folder));
-  if (source) list = list.filter((t) => t.source === source);
+  let list = all.filter((t) => (q ? `${nameOf(t)} ${triggersOf(t).map((x) => x.keyword).join(" ")}`.toLowerCase().includes(q) : (t.folder ?? null) === folder));
+  if (source) list = list.filter((t) => triggersOf(t).some((x) => x.source === source));
   if (state === "live") list = list.filter((t) => t.enabled);
   if (state === "draft") list = list.filter((t) => statusOf(t) === "draft" || t.draft);
   if (state === "off") list = list.filter((t) => statusOf(t) === "off");
@@ -410,8 +466,15 @@ ${menuForm(t.id, "delete", "Delete", ` onsubmit="return confirm('Move to Trash?'
       return `<article class="au-row"><span class="cb">${admin ? `<input type="checkbox" name="ids" value="${t.id}" form="bulk" aria-label="Select ${esc(name)}">` : ""}</span>
 <div class="nmc"><a class="nm" href="/admin/flows/${t.id}">${badge(t)}<span>${esc(name)}</span></a></div><span class="sp"></span>
 <div class="mc-num runs">${s.runs.toLocaleString("en-US")}</div><div class="mc-num ctr">${pct(s.clicks, s.runs)}</div><div class="mod">${ago(t.updated_at ?? t.created_at, now)}</div>${menu}
-<span class="sp"></span><div class="trg"><span class="ig"></span>${triggerLine(t, label)}${t.draft && t.published_at ? ` · <i>unpublished changes</i>` : ""}${q && t.folder ? ` · in ${esc(t.folder)}` : ""}</div>
-<div class="sw">${sw}</div><div class="sub">${s.runs.toLocaleString("en-US")}</div><div class="sub">${pct(s.clicks, s.runs)}</div><span class="sp"></span><span class="sp"></span></article>`;
+${triggersOf(t)
+  .map((x, i, list) => {
+    // One line per trigger, each with its own numbers when there's more than one; the switch is the automation's.
+    const n = list.length > 1 ? (s.via?.get(x.id) ?? { runs: 0, clicks: 0 }) : s;
+    const note = i ? "" : `${t.draft && t.published_at ? ` · <i>unpublished changes</i>` : ""}${q && t.folder ? ` · in ${esc(t.folder)}` : ""}`;
+    return `<span class="sp"></span><div class="trg"><span class="ig"></span>${triggerLine(x, label)}${note}</div>
+<div class="sw">${i ? "" : sw}</div><div class="sub">${n.runs.toLocaleString("en-US")}</div><div class="sub">${pct(n.clicks, n.runs)}</div><span class="sp"></span><span class="sp"></span>`;
+  })
+  .join("")}${broadcastLine(broadcasts.get(t.id), s.runs, now)}</article>`;
     })
     .join("");
   const counts = new Map<string, number>();
@@ -518,20 +581,27 @@ const SET_SQL: Record<ContactSet, string> = {
 const asSet = (v: unknown): ContactSet => (v === "opened" || v === "clicked" ? v : "all");
 // Every message it sent, plus each run itself, so a run that only did actions (tag, start another automation) still
 // lists its person. Run rows have no id or seen_at, so they never count as opened or clicked.
-const REACHED = `FROM (SELECT id, subscriber_id, seen_at, created_at FROM flow_sends WHERE trigger_id = ?1 AND status = 'sent'
+// `via` narrows it to the people one trigger of the When... card started (Key metrics' trigger picker); runs from
+// before triggers were recorded count as the main one's. Ids are checked, so the literal is safe.
+const viaOk = (v: unknown): string | null => (typeof v === "string" && /^[A-Za-z0-9_-]{1,24}$/.test(v) ? v : null);
+const reached = (via: string | null = null) => `FROM (SELECT id, subscriber_id, seen_at, created_at FROM flow_sends WHERE trigger_id = ?1 AND status = 'sent'
     UNION ALL SELECT NULL, subscriber_id, NULL, created_at FROM flow_starts WHERE trigger_id = ?1 AND status = 'sent') s
-  JOIN leads l ON l.subscriber_id = s.subscriber_id WHERE (?2 = 'admin' OR l.test = 1)`;
+  JOIN leads l ON l.subscriber_id = s.subscriber_id WHERE (?2 = 'admin' OR l.test = 1)${
+    via ? ` AND s.subscriber_id IN (SELECT subscriber_id FROM flow_starts WHERE trigger_id = ?1 AND COALESCE(via, 'main') = '${via}')` : ""
+  }`;
 
 // Sends = how many times it ran; the rest are people. Opened is a floor (read receipts only).
-export async function keyMetrics(env: Env, id: number, who: Role): Promise<{ sends: number; contacts: number; opened: number; clicked: number }> {
+export async function keyMetrics(env: Env, id: number, who: Role, via: string | null = null): Promise<{ sends: number; contacts: number; opened: number; clicked: number }> {
   const r = await env.DB.prepare(
     `SELECT COUNT(DISTINCT s.subscriber_id) AS contacts, COUNT(DISTINCT CASE WHEN ${SET_SQL.opened} THEN s.subscriber_id END) AS opened,
-       COUNT(DISTINCT CASE WHEN ${SET_SQL.clicked} THEN s.subscriber_id END) AS clicked ${REACHED}`,
+       COUNT(DISTINCT CASE WHEN ${SET_SQL.clicked} THEN s.subscriber_id END) AS clicked ${reached(via)}`,
   )
     .bind(id, who)
     .first<{ contacts: number; opened: number; clicked: number }>();
   const runs = await env.DB.prepare(
-    `SELECT COUNT(*) AS n FROM flow_starts f JOIN leads l ON l.subscriber_id = f.subscriber_id WHERE f.trigger_id = ?1 AND f.status = 'sent' AND (?2 = 'admin' OR l.test = 1)`,
+    `SELECT COUNT(*) AS n FROM flow_starts f JOIN leads l ON l.subscriber_id = f.subscriber_id WHERE f.trigger_id = ?1 AND f.status = 'sent' AND (?2 = 'admin' OR l.test = 1)${
+      via ? ` AND COALESCE(f.via, 'main') = '${via}'` : ""
+    }`,
   )
     .bind(id, who)
     .first<{ n: number }>();
@@ -540,7 +610,8 @@ export async function keyMetrics(env: Env, id: number, who: Role): Promise<{ sen
 }
 
 // The newest 100 people in a set, with when the automation last messaged them.
-async function reachedContacts(env: Env, id: number, who: Role, set: ContactSet): Promise<Response> {
+async function reachedContacts(env: Env, id: number, who: Role, set: ContactSet, via: string | null): Promise<Response> {
+  const REACHED = reached(via);
   const { results } = await env.DB.prepare(
     `SELECT l.subscriber_id AS id, l.username, l.first_name AS name, l.profile_pic AS pic, MAX(s.created_at) AS at ${REACHED} AND ${SET_SQL[set]}
      GROUP BY l.subscriber_id ORDER BY at DESC LIMIT 100`,
@@ -620,7 +691,9 @@ export async function flowsPage(env: Env, req: Request, path: string, who: Role)
   if (path === "/admin/flows/editor.js") return new Response(EDITOR_JS, { headers: { "Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "no-cache" } });
   if (path === "/admin/flows/icebreakers" || path === "/admin/flows/menu") return profilePage(env, who, path.endsWith("menu") ? "menu" : "icebreakers");
   const list = path.match(/^\/admin\/flows\/(\d+)\/contacts$/);
-  if (list) return reachedContacts(env, Number(list[1]), who, asSet(new URL(req.url).searchParams.get("set")));
+  if (list) return reachedContacts(env, Number(list[1]), who, asSet(new URL(req.url).searchParams.get("set")), viaOk(new URL(req.url).searchParams.get("via")));
+  const metrics = path.match(/^\/admin\/flows\/(\d+)\/metrics$/);
+  if (metrics) return Response.json(await keyMetrics(env, Number(metrics[1]), who, viaOk(new URL(req.url).searchParams.get("via"))));
   const m = path.match(/^\/admin\/flows\/(\d+)$/);
   const t = m ? await getT(env, Number(m[1])) : null;
   if (!t) return path === "/admin/flows/new" ? Response.redirect(new URL("/admin/automations", req.url).toString(), 302) : new Response("not found", { status: 404 });
@@ -687,7 +760,7 @@ export async function flowsAdminPost(env: Env, req: Request, path: string, who: 
   if (!row || !t) return new Response("not found", { status: 404 });
   const id = t.id;
   const action = row[3];
-  const input = wantsJson ? ((await req.json().catch(() => ({}))) as { graph?: unknown; name?: string; set?: string; tag?: string }) : null;
+  const input = wantsJson ? ((await req.json().catch(() => ({}))) as { graph?: unknown; name?: string; set?: string; tag?: string; via?: string }) : null;
   const form = wantsJson ? null : await req.formData().catch(() => null);
 
   switch (action) {
@@ -701,6 +774,8 @@ export async function flowsAdminPost(env: Env, req: Request, path: string, who: 
       const problems = validate(g);
       const rival = g.trigger.source === "comment" && g.trigger.media_id === NEXT_POST ? await waitingForNextPost(env, id) : null;
       if (rival) problems.push(`When...: "${nameOf(rival)}" is already waiting for the next post. Only one automation can wait for it at a time.`);
+      const owner = await dmKeywordOwner(env.DB, id, dmWords([g.trigger, ...g.more]));
+      if (owner) problems.push(dmClash(owner));
       if (problems.length) return json({ ok: false, problems }, 400);
       await publish(env.DB, id, g, now);
       return json({ ok: true, status: "live" });
@@ -721,7 +796,7 @@ export async function flowsAdminPost(env: Env, req: Request, path: string, who: 
       const tag = String(input?.tag ?? "").trim().toLowerCase().slice(0, 40);
       if (!tag) return json({ ok: false }, 400);
       const r = await env.DB.prepare(
-        `INSERT OR IGNORE INTO lead_tags (subscriber_id, tag, created_at) SELECT DISTINCT s.subscriber_id, ?3, ?4 ${REACHED} AND ${SET_SQL[asSet(input?.set)]}`,
+        `INSERT OR IGNORE INTO lead_tags (subscriber_id, tag, created_at) SELECT DISTINCT s.subscriber_id, ?3, ?4 ${reached(viaOk(input?.via))} AND ${SET_SQL[asSet(input?.set)]}`,
       )
         .bind(id, who, tag, now)
         .run();
@@ -735,7 +810,10 @@ export async function flowsAdminPost(env: Env, req: Request, path: string, who: 
     case "toggle": {
       // A draft that was never published has nothing to turn on: Publish does that.
       // A Next Post or Reel trigger switched back on waits for the next post from now, and never while another one waits.
-      const blocked = !t.enabled && t.media_id === NEXT_POST && (await waitingForNextPost(env, id));
+      // Nor while another live automation already answers one of its DM keywords.
+      const owner = t.enabled ? null : await dmKeywordOwner(env.DB, id, dmWords(triggersOf(t)));
+      if (owner && wantsJson) return json({ ok: false, problems: [dmClash(owner)] }, 400);
+      const blocked = (!t.enabled && t.media_id === NEXT_POST && (await waitingForNextPost(env, id))) || owner;
       if (statusOf(t) !== "draft" && !blocked) {
         await env.DB.prepare(
           `UPDATE triggers SET enabled = 1 - enabled, published_at = CASE WHEN enabled = 0 AND media_id = ?3 THEN ?2 ELSE COALESCE(published_at, created_at) END, updated_at = ?2 WHERE id = ?1`,

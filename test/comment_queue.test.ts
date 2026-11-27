@@ -156,6 +156,43 @@ describe("refused as too many new conversations", () => {
   });
 });
 
+describe("a DM keyword trigger added while Instagram refuses the comment DMs", () => {
+  const REFUSED = "The thread owner has archived or deleted this conversation, or the thread does not exist.";
+  const more = async (env: Env, id = 1) => JSON.parse((await env.DB.prepare(`SELECT more FROM triggers WHERE id = ?1`).bind(id).first<{ more: string | null }>())?.more ?? "[]");
+
+  it("the automation answers its keyword in DMs from then on, even from people who never commented, its draft too", async () => {
+    const env = await setup();
+    await env.DB.prepare(`UPDATE triggers SET public_reply = 'sent', draft = ?1`).bind(JSON.stringify({ trigger: { source: "comment", keyword: "AGENT" }, nodes: [], edges: [] })).run();
+    failNext = REFUSED;
+    await handleComment(env.DB, "tok", env.SKOOL_LINK, comment("c1"), T);
+    expect(await more(env)).toEqual([]); // not yet: the cron adds it with the "DM me" reply
+    await tellRefused(env.DB, "tok", T + MIN);
+    expect(await more(env)).toEqual([{ source: "dm", keyword: "AGENT", media_id: null, public_reply: null, id: "auto", auto: true }]);
+    const draft = JSON.parse((await env.DB.prepare(`SELECT draft FROM triggers WHERE id = 1`).first<{ draft: string }>())!.draft);
+    expect(draft.more).toEqual(await more(env));
+
+    // Someone who only read the reply under another comment DMs the word.
+    await env.DB.prepare(`INSERT INTO leads (subscriber_id, created_at, last_inbound_at) VALUES ('reader', ?1, ?1)`).bind(T + 2 * MIN).run();
+    expect(await handleInboundFlow(env as any, "tok", { lead_id: "reader", text: "agent pls" } as any, undefined, false, T + 2 * MIN)).toBe(true);
+    expect((await env.DB.prepare(`SELECT via FROM flow_starts WHERE subscriber_id = 'reader'`).first<{ via: string }>())?.via).toBe("auto");
+
+    failNext = REFUSED;
+    await handleComment(env.DB, "tok", env.SKOOL_LINK, comment("c2"), T + 3 * MIN);
+    await tellRefused(env.DB, "tok", T + 4 * MIN);
+    expect(await more(env)).toHaveLength(1); // once
+  });
+
+  it("not when another live automation already answers that DM keyword", async () => {
+    const env = await setup();
+    await env.DB.prepare(`UPDATE triggers SET public_reply = 'sent'`).run();
+    await env.DB.prepare(`INSERT INTO triggers (source, keyword, dm, enabled, created_at) VALUES ('dm', 'free, agent', '', 1, 1)`).run();
+    failNext = REFUSED;
+    await handleComment(env.DB, "tok", env.SKOOL_LINK, comment("c1"), T);
+    await tellRefused(env.DB, "tok", T + MIN);
+    expect(await more(env)).toEqual([]);
+  });
+});
+
 describe("backlog of refused comments", () => {
   const REFUSED = "The thread owner has archived or deleted this conversation, or the thread does not exist.";
   const publicReplies = () => calls.filter((c) => c.url.includes("/replies?")).map((c) => new URL(c.url).searchParams.get("message"));
@@ -186,6 +223,24 @@ describe("backlog of refused comments", () => {
     expect(publicReplies()).toHaveLength(2);
     expect(await tellBacklog(e, "tok", T + 12 * MIN + 25 * 60 * MIN)).toBe(true);
     expect(publicReplies()).toHaveLength(3);
+  });
+
+  it("our own database restarting mid-reply isn't Instagram refusing: the replies carry on next minute", async () => {
+    vi.spyOn(pace, "sleep").mockResolvedValue();
+    const env = await setup();
+    await env.DB.prepare(`UPDATE triggers SET public_reply = 'gotchu, sent'`).run();
+    failNext = REFUSED;
+    await handleComment(env.DB, "tok", env.SKOOL_LINK, comment("one"), T);
+    await env.DB.prepare(`UPDATE comments SET fallback_at = -1`).run();
+    const e = { ...env, ALERT_TOPIC: undefined } as unknown as Env;
+    const batch = env.DB.batch;
+    env.DB.batch = (async () => {
+      throw new Error("D1_ERROR: D1 DB exceeded its CPU time limit and was reset.");
+    }) as never;
+    expect(await tellBacklog(e, "tok", T + 10 * MIN)).toBe(false);
+    env.DB.batch = batch;
+    expect(await db.getSetting(env.DB, "backlog_replies_paused_until")).toBeNull();
+    expect(await tellBacklog(e, "tok", T + 11 * MIN)).toBe(true);
   });
 });
 

@@ -71,11 +71,12 @@ async function save(id, g) {
 
 switch (cmd) {
   case "list": {
-    const rows = sql(`SELECT t.id, t.name, t.keyword, t.source, t.media_id, t.enabled, t.published_at, t.deleted_at, (SELECT COUNT(*) FROM flow_starts s WHERE s.trigger_id = t.id) runs
+    const rows = sql(`SELECT t.id, t.name, t.keyword, t.source, t.media_id, t.enabled, t.published_at, t.deleted_at, t.more, (SELECT COUNT(*) FROM flow_starts s WHERE s.trigger_id = t.id) runs
       FROM triggers t WHERE t.id > 0 ${flags.all ? "" : "AND t.deleted_at IS NULL"} ORDER BY t.id`);
     for (const t of rows) {
       const st = t.deleted_at ? "TRASH" : t.enabled ? "LIVE " : t.published_at ? "OFF  " : "DRAFT";
-      console.log(`#${String(t.id).padEnd(4)} ${st} ${String(t.runs).padStart(5)} runs  ${t.source.padEnd(7)} ${String(t.keyword || "-").padEnd(12)} ${postOf(t.media_id).padEnd(23)} ${t.name ?? ""}`);
+      const more = (t.more ? JSON.parse(t.more) : []).map((x) => ` +${x.source} ${x.keyword}`).join("");
+      console.log(`#${String(t.id).padEnd(4)} ${st} ${String(t.runs).padStart(5)} runs  ${t.source.padEnd(7)} ${String(t.keyword || "-").padEnd(12)} ${postOf(t.media_id).padEnd(23)} ${t.name ?? ""}${more}`);
     }
     break;
   }
@@ -85,6 +86,7 @@ switch (cmd) {
     const t = b.graph.trigger;
     console.log(`#${b.id} ${b.name}  [${b.status.toUpperCase()}${b.hasDraft ? ", unpublished draft" : ""}]`);
     console.log(`When: ${t.source} "${t.keyword}" on ${postOf(t.media_id)}${t.public_reply ? `\nPublic replies: ${t.public_reply.split("\n").join(" | ")}` : ""}`);
+    for (const x of b.graph.more ?? []) console.log(`  or: ${x.source} "${x.keyword}"${x.source === "story" && x.media_id ? ` on story ${x.media_id}` : ""}${x.auto ? " (added automatically)" : ""}  [${x.id}]`);
     for (const n of b.graph.nodes.filter((n) => n.kind !== "trigger")) {
       const s = b.stats?.[n.id];
       const head = `- ${n.id} ${n.kind}${s?.sent != null ? ` (sent ${s.sent}${s.clicked != null ? `, clicked ${s.clicked}` : ""})` : ""}`;

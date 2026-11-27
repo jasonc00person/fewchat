@@ -10,7 +10,7 @@ import { syncComments } from "../src/comment_sync";
 import { editorGraph } from "../src/graph";
 import * as db from "../src/db";
 import { ORIGIN, runDueFlows } from "../src/flows";
-import { graphStats, loadGraph, sanitize, type Graph } from "../src/graph";
+import { graphStats, loadGraph, sanitize, validate, type Graph } from "../src/graph";
 import worker from "../src/index";
 import { hmacHex } from "../src/meta";
 import type { Env } from "../src/setter";
@@ -178,6 +178,7 @@ describe("migrating the linear builder's automations", () => {
 
 const BRANCHY: Graph = {
   trigger: { source: "dm", keyword: "start", media_id: null, public_reply: null },
+  more: [],
   nodes: [
     { id: "trigger", kind: "trigger", x: 0, y: 0, data: {} },
     {
@@ -313,6 +314,7 @@ describe("the canvas: draft, publish, branching runs", () => {
     const id = await newAutomation(env);
     const g: Graph = {
       trigger: { source: "dm", keyword: "guide", media_id: null, public_reply: null },
+      more: [],
       nodes: [
         { id: "trigger", kind: "trigger", x: 0, y: 0, data: {} },
         { id: "c", kind: "condition", x: 380, y: 0, data: { match: "all", rules: [{ field: "follows", op: "is", value: "" }] } },
@@ -650,5 +652,123 @@ describe("the published view: key metrics and the people behind them", () => {
     expect(b.graph.nodes.map((n) => n.id)).toContain("extra");
     expect(b.published!.nodes.map((n) => n.id)).not.toContain("extra");
     expect(b.published!.nodes.length).toBe(live.nodes.length);
+  });
+});
+
+describe("broadcast status on the Automations page", () => {
+  it("each card says whether its broadcast is sending, scheduled, paused or finished, apart from the switch", async () => {
+    const env = await connected();
+    const now = Date.now();
+    const ids: number[] = [];
+    for (const [status, extra] of [
+      ["paused", { note: "reached its cap of 330 (12 more inside the window right now)" }],
+      ["running", { start_at: now + 3600_000 }],
+      ["running", {}],
+      ["done", {}],
+    ] as const) {
+      const id = await newAutomation(env);
+      ids.push(id);
+      await db.setSetting(env.DB, `broadcast:${id}`, JSON.stringify({ status, per_min: 4, cap: 330, left: 75, ...extra }));
+    }
+    const plain = await newAutomation(env);
+    const page = await (await get(env, "/admin/automations")).text();
+    const card = (id: number) => page.slice(page.indexOf(`href="/admin/flows/${id}"`), page.indexOf("</article>", page.indexOf(`href="/admin/flows/${id}"`)));
+    expect(card(ids[0])).toContain('<div class="bc paused"><b>Broadcast paused</b><span>0 sent of 330 · 75 reachable now · reached its cap of 330</span></div>');
+    expect(card(ids[1])).toContain(`<div class="bc scheduled"><b>Broadcast scheduled</b><span>starts <time data-t="${now + 3600_000}"></time> · 0 sent of 330 · 4 a minute · 75 reachable now</span>`);
+    expect(card(ids[2])).toContain('<div class="bc running"><b>Broadcast sending</b>');
+    expect(card(ids[3])).toContain('<div class="bc done"><b>Broadcast finished</b><span>0 sent of 330</span>');
+    expect(card(plain)).not.toContain('class="bc');
+  });
+});
+
+describe("more than one trigger on an automation", () => {
+  // A comment automation that also answers the DM keyword STYLE: one card, both counted.
+  const STYLE = (): Graph => ({
+    trigger: { source: "comment", keyword: "style", media_id: "reel1", public_reply: null },
+    more: [{ id: "d1", source: "dm", keyword: "STYLE", media_id: null, public_reply: null }],
+    nodes: [
+      { id: "trigger", kind: "trigger", x: 0, y: 0, data: {} },
+      { id: "m1", kind: "message", x: 380, y: 0, data: { bubbles: [{ text: "here's the style skill", buttons: [] }], quick_replies: [] } },
+    ],
+    edges: [{ from: "trigger", port: "next", to: "m1" }],
+  });
+
+  it("a comment and a DM keyword run the same automation, each counted on its own line and together", async () => {
+    const env = await connected();
+    const id = await newAutomation(env);
+    expect(await (await api(env, `/admin/flows/${id}/publish`, { graph: STYLE() })).json()).toEqual({ ok: true, status: "live" });
+    expect(JSON.parse((await getT(env, id))!.more!)).toEqual([{ id: "d1", source: "dm", keyword: "STYLE", media_id: null, public_reply: null }]);
+
+    await post(env, comment("Style", "c1")); // from LEAD (the mock answers every private reply as LEAD's thread)
+    expect(sends()[0].body.recipient).toEqual({ comment_id: "c1" });
+    await post(env, dm("m1", "style", "702")); // never commented
+    expect(textOf(sent().at(-1))).toBe("here's the style skill");
+    const via = (await env.DB.prepare(`SELECT subscriber_id, via FROM flow_starts WHERE trigger_id = ?1 ORDER BY subscriber_id`).bind(id).all()).results;
+    expect(via).toEqual([{ subscriber_id: "702", via: "d1" }, { subscriber_id: LEAD, via: "main" }]);
+    expect((await graphStats(env.DB, id)).trigger.sent).toBe(2);
+
+    // The list: one line per trigger with its own runs; the automation's total on top.
+    const page = await (await get(env, "/admin/automations")).text();
+    const row = page.slice(page.indexOf(`href="/admin/flows/${id}"`));
+    expect(row).toMatch(/mc-num runs">2</);
+    expect(row).toContain("User comments on specific Post or Reel");
+    expect(row).toContain('User sends a message that contains <span class="chip">STYLE</span>');
+    expect([...row.slice(0, row.indexOf("</article>")).matchAll(/class="sub">(\d+)</g)].map((m) => m[1])).toEqual(["1", "1"]);
+    expect((await (await get(env, "/admin/automations?trigger=dm")).text())).toContain(`href="/admin/flows/${id}"`); // the trigger filter sees it
+
+    // Key metrics: all triggers, or one.
+    const m = async (q: string) => (await (await get(env, `/admin/flows/${id}/metrics${q}`)).json()) as { sends: number; contacts: number };
+    expect(await m("")).toMatchObject({ sends: 2, contacts: 2 });
+    expect(await m("?via=d1")).toMatchObject({ sends: 1, contacts: 1 });
+    expect(await m("?via=main")).toMatchObject({ sends: 1, contacts: 1 });
+    const who = (await (await get(env, `/admin/flows/${id}/contacts?set=all&via=d1`)).json()) as { contacts: { id: string }[] };
+    expect(who.contacts.map((c) => c.id)).toEqual(["702"]);
+    expect((await m("?via=x' OR 1=1 --")).sends).toBe(2); // not an id: ignored, never pasted into SQL
+  });
+
+  it("a comment trigger is always the main one, extras are DM, story or mention, and each needs its keyword", () => {
+    const fb = { source: "dm" as const, keyword: "", media_id: null, public_reply: null };
+    const g = sanitize(
+      {
+        trigger: { source: "dm", keyword: "hi" },
+        more: [
+          { id: "a", source: "comment", keyword: "guide", media_id: "reel1", public_reply: "sent" },
+          { id: "b", source: "comment", keyword: "two" }, // a second comment trigger
+          { id: "c", source: "welcome" },
+          { id: "a", source: "story", keyword: "" }, // same id again
+          { id: "e", source: "mention" },
+        ],
+        nodes: [],
+        edges: [],
+      },
+      fb,
+    );
+    expect(g.trigger).toEqual({ source: "comment", keyword: "guide", media_id: "reel1", public_reply: "sent" });
+    expect(g.more.map((x) => `${x.id} ${x.source} ${x.keyword}`)).toEqual(["a dm hi", "t4x2 story ", "e mention *"]);
+    expect(validate(g)).toContain("When...: trigger 3 needs at least one keyword (or * for anything).");
+    expect(sanitize({ trigger: { source: "dm", keyword: "x" } }, fb).more).toEqual([]); // drafts from before
+  });
+
+  it("a DM keyword can start only one live automation: Publish and switching on say which one has it", async () => {
+    const env = await connected();
+    const a = await newAutomation(env);
+    await api(env, `/admin/flows/${a}/publish`, { graph: STYLE() });
+    const b = await newAutomation(env);
+    const g: Graph = { ...STYLE(), trigger: { source: "dm", keyword: "free, Style!", media_id: null, public_reply: null }, more: [] };
+    const res = await api(env, `/admin/flows/${b}/publish`, { graph: g });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { problems: string[] }).problems).toEqual([
+      `When...: "Untitled automation" already answers the DM keyword STYLE. A DM keyword can start only one automation, so take it off that one first.`,
+    ]);
+    // A comment keyword can repeat (it's tied to its post), so another STYLE reel publishes fine.
+    const c = await newAutomation(env);
+    expect((await api(env, `/admin/flows/${c}/publish`, { graph: { ...STYLE(), trigger: { ...STYLE().trigger, media_id: "reel2" }, more: [] } })).status).toBe(200);
+    // Off, B takes the word; A can't come back on while B has it.
+    await api(env, `/admin/automations/${a}/toggle`);
+    expect((await api(env, `/admin/flows/${b}/publish`, { graph: g })).status).toBe(200);
+    expect((await api(env, `/admin/automations/${a}/toggle`)).status).toBe(400);
+    expect((await getT(env, a))!.enabled).toBe(0);
+    await worker.fetch(form(`/admin/automations/${a}/toggle`), env, ctx); // the list's switch: refused quietly
+    expect((await getT(env, a))!.enabled).toBe(0);
   });
 });

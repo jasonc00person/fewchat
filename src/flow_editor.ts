@@ -30,6 +30,7 @@ html:has(.fe),body:has(.fe){height:100%;overflow:hidden}
 .fe-km.shut{transform:translateX(-100%);visibility:hidden;transition:transform .3s var(--ease),visibility 0s .3s}
 .fe-km h2{font-size:20px;line-height:32px;font-weight:700;margin:0}
 .fe-km .trg{color:var(--mut);font-size:13px;line-height:18px;margin:4px 0 20px}
+.fe-km select.kmv{display:block;max-width:100%;margin:8px 0 20px;padding:6px 10px;font:inherit;font-size:14px;color:var(--ink);background:var(--panel);border:1px solid var(--line);border-radius:6px}
 .fe-km .tiles{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 .fe-km .tile{position:relative;display:block;width:100%;min-height:96px;margin:0;padding:12px;text-align:left;background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:6px;font-weight:400}
 .fe-km .tile:hover{background:var(--hover)}
@@ -114,6 +115,8 @@ dialog.fe-dlg::backdrop{background:rgba(0,0,0,.45)}
 .nd .stats div{flex:1;font-size:15px;font-weight:600;color:var(--pri);font-variant-numeric:tabular-nums}.nd .stats small{display:block;font-size:10px;font-weight:400;color:var(--mut)}
 .nd .trg{background:color-mix(in srgb,var(--green) 16%,var(--elev));border-radius:12px;padding:10px 12px;margin:2px 0 8px}
 .nd .trg .chip{padding:0 7px;line-height:18px;margin:2px 3px 0 0;background:var(--elev);border:1px solid var(--line)}
+.nd .trg.cur{box-shadow:inset 0 0 0 2px var(--pri)}.nd .trg small.auto{display:block;color:var(--mut);font-size:11px;margin-top:2px}
+.nd .add-trig{color:var(--pri);font-weight:600;padding:2px 2px 8px;cursor:pointer}
 .nd .bb{background:var(--soft);border-radius:14px;padding:9px 12px;margin:0 0 8px}
 .nd .tx{white-space:pre-wrap;word-break:break-word;max-height:126px;overflow:hidden}.nd .tx .lk{color:var(--pri)}
 .nd .ph{color:var(--mut)}
@@ -181,6 +184,8 @@ var kmShut = window.innerWidth < 768;
 try { if (localStorage.getItem("km") === "shut") kmShut = true; } catch (e) {}
 var view = { x: 60, y: 60, z: 1 };
 var sel = null, selEdge = null, picker = null;
+var curTrig = "main";
+var kmVia = ""; // Key metrics' trigger picker: "" = all triggers // which of the When... card's triggers the side panel edits: "main" or an extra's id
 var status = B.status, dirty = !!B.hasDraft, problems = [];
 var undoStack = [], redoStack = [], lastSnap = JSON.stringify(G), snapT = null, saveT = null, saving = false, saveState = dirty ? "unpublished" : "saved";
 
@@ -245,6 +250,18 @@ function add(e, kids) {
 }
 function rid(p) { return p + Math.random().toString(36).slice(2, 8); }
 function node(id) { for (var i = 0; i < G.nodes.length; i++) if (G.nodes[i].id === id) return G.nodes[i]; return null; }
+// The When... card's triggers: the main one (G.trigger, the comment trigger whenever there is one) and the others
+// (G.more: DM keywords, story replies, mentions), each with an id ("main" for the first).
+function extras() { return G.more || (G.more = []); }
+function allTrigs() { return [Object.assign({ id: "main" }, G.trigger)].concat(extras()); }
+function trigLabel(t) { return SRC[t.source] + ((t.source === "comment" || t.source === "dm" || t.source === "story") && t.keyword && t.keyword !== "*" ? ": " + t.keyword : ""); }
+function loadMetrics() {
+  fetch("/admin/flows/" + B.id + "/metrics" + (kmVia ? "?via=" + encodeURIComponent(kmVia) : ""), { headers: { Accept: "application/json" } })
+    .then(function (r) { if (!r.ok) throw r; return r.json(); })
+    .then(function (m) { B.metrics = m; renderChrome(); })
+    .catch(function () { /* the tiles keep the last numbers */ });
+}
+function trigById(id) { var m = extras().filter(function (x) { return x.id === id; })[0]; return m || G.trigger; }
 function edgeFrom(id, port) { for (var i = 0; i < G.edges.length; i++) if (G.edges[i].from === id && G.edges[i].port === port) return G.edges[i]; return null; }
 function stat(id) { return (B.stats && B.stats[id]) || {}; }
 function pct(a, b) { return b ? (Math.round((1000 * a) / b) / 10) + "%" : "n/a"; }
@@ -325,7 +342,10 @@ function renderChrome() {
   km.innerHTML = "";
   add(km, [
     h("h2", { text: "Key metrics" }),
-    h("p", { class: "trg", text: SRC[G.trigger.source] || "" }),
+    allTrigs().length > 1
+      ? h("select", { class: "kmv", "aria-label": "Trigger", onchange: function (e) { kmVia = e.target.value; loadMetrics(); } },
+          [h("option", { value: "", text: "All triggers" })].concat(allTrigs().map(function (t) { return h("option", { value: t.id, text: trigLabel(t), selected: kmVia === t.id }); })))
+      : h("p", { class: "trg", text: SRC[G.trigger.source] || "" }),
     h("div", { class: "tiles" }, [
       tile("Sends", m.sends, "times", "all"),
       tile("Unique Contacts", m.contacts, null, "all"),
@@ -352,7 +372,7 @@ function openContacts(set, label) {
     e.preventDefault();
     var tag = input.value.trim();
     if (!tag) return;
-    api("tag", { set: set, tag: tag }).then(function (j) {
+    api("tag", { set: set, tag: tag, via: kmVia }).then(function (j) {
       note.textContent = j.httpOk ? "Tagged everyone here \"" + j.tag + "\"" + (j.added ? " (" + fmt(j.added) + " new)" : " (they all had it)") : "Couldn't tag them. Try again.";
       if (j.httpOk) input.value = "";
     });
@@ -361,7 +381,7 @@ function openContacts(set, label) {
   var body = h("div", { class: "bd" }, h("div", { class: "msg", text: "Loading…" }));
   var foot = h("div", { class: "ft" }, [note]);
   add(d, [body, foot]);
-  fetch("/admin/flows/" + B.id + "/contacts?set=" + set, { headers: { Accept: "application/json" } })
+  fetch("/admin/flows/" + B.id + "/contacts?set=" + set + (kmVia ? "&via=" + encodeURIComponent(kmVia) : ""), { headers: { Accept: "application/json" } })
     .then(function (r) { if (!r.ok) throw r; return r.json(); })
     .then(function (j) {
       body.innerHTML = "";
@@ -534,7 +554,11 @@ function card(n) {
   var st = stat(n.id), d = n.data, body = [], foot = null;
   if (n.kind === "trigger") {
     body.push(statsRow([[fmt(st.sent), "Runs"]]));
-    body.push(h("div", { class: "trg" }, trigText(G.trigger)));
+    var many = allTrigs().length > 1;
+    allTrigs().forEach(function (t) {
+      body.push(h("div", { class: "trg" + (many && sel === "trigger" && curTrig === t.id ? " cur" : ""), "data-trig": t.id }, trigText(t).concat(t.auto ? [h("small", { class: "auto", text: "Added automatically" })] : [])));
+    });
+    if (!RO && allTrigs().length < 10) body.push(h("div", { class: "add-trig", text: "+ New Trigger" }));
     foot = nextRow(n, "Then");
   } else if (n.kind === "message") {
     var sent = st.sent || 0, ports = st.ports || {};
@@ -760,7 +784,10 @@ vp.addEventListener("pointerdown", function (e) {
   var t = e.target, pt = t.closest(".pt"), nd = t.closest(".nd"), hit = t.closest("path.hit");
   var base = { pid: e.pointerId, sx: e.clientX, sy: e.clientY, lx: e.clientX, ly: e.clientY };
   if (pt && !RO) gest = Object.assign(base, { type: "connect", from: pt.dataset.n, port: pt.dataset.p, pt: pt });
-  else if (nd) { var n = node(nd.dataset.id); gest = Object.assign(base, { type: "node", id: n.id, el: nd, ox: n.x, oy: n.y }); }
+  else if (nd) {
+    var n = node(nd.dataset.id), tr = t.closest("[data-trig]");
+    gest = Object.assign(base, { type: "node", id: n.id, el: nd, ox: n.x, oy: n.y, trig: tr ? tr.dataset.trig : null, addTrig: !!t.closest(".add-trig") });
+  }
   else if (hit) { selEdge = { from: hit.dataset.from, port: hit.dataset.port }; draw(); gest = null; return; }
   else gest = Object.assign(base, { type: "pan", ox: view.x, oy: view.y });
   e.preventDefault();
@@ -814,7 +841,11 @@ function up(e) {
   var lost = e.type === "pointercancel" || e.type === "lostpointercapture" || (e.pointerType === "mouse" && e.type === "pointermove");
   var x = lost ? g.lx : e.clientX, y = lost ? g.ly : e.clientY;
   if (g.type === "pan" && !g.moved) { select(null); selEdge = null; draw(); }
-  else if (g.type === "node") { if (g.moved) { if (!RO) changed(false); } else if (!lost) select(g.id); }
+  else if (g.type === "node") {
+    if (g.moved) { if (!RO) changed(false); }
+    else if (!lost && g.addTrig && !RO) addTrigger();
+    else if (!lost) { if (g.trig) curTrig = g.trig; select(g.id); if (g.id === "trigger") renderNodes(); }
+  }
   else if (g.type === "connect") {
     tmp = null;
     draw();
@@ -929,9 +960,48 @@ function tagList() { return h("datalist", { id: "fe-tags" }, B.tags.map(function
 function stageOpts() { var o = {}; B.stages.forEach(function (s) { o[s] = s.replace("_", " "); }); return o; }
 function autoOpts() { var o = { "": "Pick an automation" }; B.automations.forEach(function (a) { if (String(a.id) !== String(B.id)) o[a.id] = a.name; }); return o; }
 
+function addTrigger() {
+  var x = { id: rid("t"), source: "dm", keyword: "", media_id: null, public_reply: null };
+  extras().push(x);
+  curTrig = x.id;
+  sel = "trigger";
+  changed(true);
+}
+function removeTrigger() {
+  if (curTrig === "main") {
+    var first = extras().shift();
+    G.trigger = { source: first.source, keyword: first.keyword, media_id: first.media_id, public_reply: first.public_reply };
+  } else G.more = extras().filter(function (x) { return x.id !== curTrig; });
+  curTrig = "main";
+  changed(true);
+}
+// An extra trigger can be a DM keyword, a story reply or a mention. Picking "comment" for one makes it the main
+// trigger (one comment trigger per automation) and moves the old main one into its place.
+function setSource(t, v) {
+  if (v === "comment" && t !== G.trigger) {
+    var old = G.trigger;
+    G.trigger = { source: "comment", keyword: t.keyword === "*" ? "" : t.keyword, media_id: null, public_reply: null };
+    t.source = old.source; t.keyword = old.keyword; t.media_id = old.media_id; t.public_reply = null;
+    curTrig = "main";
+    return;
+  }
+  if (v !== t.source) t.media_id = null;
+  t.source = v;
+  if (v === "mention" || v === "welcome" || v === "none") t.keyword = "*"; else if (t.keyword === "*") t.keyword = "";
+}
 function triggerForm() {
-  var t = G.trigger, out = [];
-  out.push(lbl("When…"), pick(t.source, SRC, function (v) { if (v !== t.source) t.media_id = null; t.source = v; if (v === "mention" || v === "welcome" || v === "none") t.keyword = "*"; else if (t.keyword === "*") t.keyword = ""; }));
+  var t = trigById(curTrig), out = [], list = allTrigs(), main = t === G.trigger;
+  if (main) curTrig = "main";
+  var opts = SRC;
+  if (!main || list.length > 1) {
+    opts = {};
+    Object.keys(SRC).forEach(function (k) {
+      if (main ? k !== "welcome" && k !== "none" : k === "dm" || k === "story" || k === "mention" || (k === "comment" && G.trigger.source !== "comment")) opts[k] = SRC[k];
+    });
+  }
+  out.push(lbl(list.length > 1 ? "Trigger " + (list.map(function (x) { return x.id; }).indexOf(curTrig) + 1) + " of " + list.length : "When…"), pick(t.source, opts, function (v) { setSource(t, v); }));
+  if (t.auto) out.push(h("p", { class: "hint", text: "FewChat added this when Instagram started refusing this post's comment DMs, because the public reply tells people to DM the keyword. Remove it if you don't want it." }));
+  if (t.source === "dm") out.push(h("p", { class: "hint", text: "A DM keyword can start only one live automation, so the same word can't be on two." }));
   if (t.source === "comment" || t.source === "dm" || t.source === "story") {
     out.push(lbl("Keywords"), inp(t.keyword === "*" && t.source !== "story" ? "*" : t.keyword, function (v) { t.keyword = v; }, { placeholder: "guide, ai   (* = anything)" }));
     out.push(h("p", { class: "hint", text: "Comma separated. Whole words, any case. * matches anything." }));
@@ -1043,6 +1113,7 @@ function renderPanel() {
   add(panel, [
     h("div", { class: "ph" }, [h("span", { class: "ic", icon: k.ic }), k.t, h("button", { class: "x", title: "Close", onclick: function () { select(null); } }, "×")]),
     h("div", { class: "pb" }, body),
+    !RO && n.kind === "trigger" && allTrigs().length > 1 ? h("div", { class: "foot" }, [h("span"), h("button", { class: "dz", onclick: removeTrigger }, "Delete trigger")]) : null,
     RO || n.kind === "trigger" ? null : h("div", { class: "foot" }, [
       h("button", { class: "ghost", onclick: function () { duplicate(n.id); } }, "Duplicate"),
       h("button", { class: "dz", onclick: function () { removeNode(n.id); } }, "Delete step")

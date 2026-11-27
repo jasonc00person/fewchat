@@ -9,8 +9,8 @@
 import { markOutgoing } from "./autonomy";
 import { matches, type Trigger } from "./comments";
 import * as db from "./db";
-import { logError } from "./health";
-import { findByName, loadGraph, publish, type ActionItem, type Bubble, type Graph, type MessageData, type Node, type QuickReply, type Rule, type Variant } from "./graph";
+import { DB_BLIP, logError } from "./health";
+import { findByName, loadGraph, moreOf, publish, triggersOf, type ActionItem, type Bubble, type Graph, type MessageData, type Node, type QuickReply, type Rule, type Variant } from "./graph";
 import { fillLink } from "./manychat";
 import { fetchProfile, graph, senderAction, subscribe, type MetaEvent } from "./meta";
 import { pace, type Env } from "./setter";
@@ -438,16 +438,24 @@ const makeRun = async (env: FlowEnv, token: string, t: Trigger, lead: string, no
 });
 
 // One run per person per automation (a second keyword DM from the same lead goes to the AI instead); a run that
-// failed before it got anywhere can be retried.
-async function claim(d: D1Database, triggerId: number, lead: string, now: number): Promise<boolean> {
-  const ins = await d.prepare(`INSERT OR IGNORE INTO flow_starts (trigger_id, subscriber_id, status, created_at) VALUES (?1, ?2, 'sending', ?3)`).bind(triggerId, lead, now).run();
+// failed before it got anywhere can be retried, and so can one still "sending" long after any walk would have
+// finished: the database restarted under it (see STALE_MS).
+// `via` = which of the automation's triggers started it (graph.ts ExtraTrigger ids, "main"), null when nothing did.
+async function claim(d: D1Database, triggerId: number, lead: string, now: number, via: string | null): Promise<boolean> {
+  const ins = await d.prepare(`INSERT OR IGNORE INTO flow_starts (trigger_id, subscriber_id, status, created_at, via) VALUES (?1, ?2, 'sending', ?3, ?4)`).bind(triggerId, lead, now, via).run();
   if (ins.meta.changes) return true;
-  const retry = await d.prepare(`UPDATE flow_starts SET status = 'sending', created_at = ?3 WHERE trigger_id = ?1 AND subscriber_id = ?2 AND status = 'failed'`).bind(triggerId, lead, now).run();
+  const retry = await d
+    .prepare(
+      `UPDATE flow_starts SET status = 'sending', created_at = ?3, via = ?4
+       WHERE trigger_id = ?1 AND subscriber_id = ?2 AND (status = 'failed' OR (status = 'sending' AND created_at < ?5))`,
+    )
+    .bind(triggerId, lead, now, via, now - STALE_MS)
+    .run();
   return Boolean(retry.meta.changes);
 }
 
-async function enter(env: FlowEnv, token: string, t: Trigger, lead: string, now: number, extra: Partial<Run>): Promise<Run | null> {
-  if (!(await claim(env.DB, t.id, lead, now))) return null;
+async function enter(env: FlowEnv, token: string, t: Trigger, lead: string, now: number, extra: Partial<Run>, via: string | null = null): Promise<Run | null> {
+  if (!(await claim(env.DB, t.id, lead, now, via))) return null;
   const run = await makeRun(env, token, t, lead, now, extra);
   const done = (status: string) => env.DB.prepare(`UPDATE flow_starts SET status = ?3 WHERE trigger_id = ?1 AND subscriber_id = ?2`).bind(t.id, lead, status).run();
   try {
@@ -460,16 +468,16 @@ async function enter(env: FlowEnv, token: string, t: Trigger, lead: string, now:
   return run;
 }
 
-export async function startFlow(env: FlowEnv, token: string, triggerId: number, leadId: string, now: number, text: string | null = null): Promise<boolean> {
+export async function startFlow(env: FlowEnv, token: string, triggerId: number, leadId: string, now: number, text: string | null = null, via: string | null = null): Promise<boolean> {
   const t = await getTrigger(env.DB, triggerId);
   if (!live(t)) return false;
-  return Boolean(await enter(env, token, t, leadId, now, { text }));
+  return Boolean(await enter(env, token, t, leadId, now, { text }, via));
 }
 
 // Comment-to-DM: the flow's first message goes out as the private reply. Null = nothing sent (already ran for them,
 // or the flow has no message before a delay); throws if Instagram refused it.
 export async function startCommentFlow(env: FlowEnv, token: string, t: Trigger, commentId: string, leadId: string, text: string, now: number): Promise<Sent | null> {
-  const run = await enter(env, token, t, leadId, now, { comment: commentId, text });
+  const run = await enter(env, token, t, leadId, now, { comment: commentId, text }, "main");
   return run?.first ?? null;
 }
 
@@ -485,10 +493,29 @@ export async function handleTap(env: FlowEnv, token: string, leadId: string, pay
   if (!send) return false;
   const port = tap[1] === "n" ? "nx" : tap[3];
   if (!port) return false;
+  // Each tap works once. A tap whose work never finished (done_at still empty well after it came in: the database
+  // restarted mid-way) can be taken over by the retry in resumeInbound.
   const first = await env.DB.prepare(`INSERT OR IGNORE INTO flow_taps (send_id, port, created_at) VALUES (?1, ?2, ?3)`).bind(send.id, port, now).run();
-  if (!first.meta.changes) return false;
+  if (!first.meta.changes) {
+    const stale = await env.DB.prepare(`UPDATE flow_taps SET created_at = ?3 WHERE send_id = ?1 AND port = ?2 AND done_at IS NULL AND created_at < ?4`)
+      .bind(send.id, port, now, now - STALE_MS)
+      .run();
+    if (!stale.meta.changes) return false;
+  }
+  const done = () => env.DB.prepare(`UPDATE flow_taps SET done_at = ?3 WHERE send_id = ?1 AND port = ?2`).bind(send.id, port, now).run();
+  try {
+    const ran = await runTap(env, token, leadId, send, tap[1], port, now);
+    await done();
+    return ran;
+  } catch (e) {
+    if (!DB_BLIP.test(String(e))) await done().catch(() => {});
+    throw e;
+  }
+}
+
+async function runTap(env: FlowEnv, token: string, leadId: string, send: FlowSend, kind: string, port: string, now: number): Promise<boolean> {
   await env.DB.prepare(`UPDATE flow_sends SET tapped_at = COALESCE(tapped_at, ?2) WHERE id = ?1`).bind(send.id, now).run();
-  if (tap[1] === "q" && /^\d+$/.test(port)) return Number(port) > 0 && startFlow(env, token, Number(port), leadId, now);
+  if (kind === "q" && /^\d+$/.test(port)) return Number(port) > 0 && startFlow(env, token, Number(port), leadId, now);
   const t = await getTrigger(env.DB, send.trigger_id);
   if (!live(t)) return false;
   const node = send.node_id ?? (send.step_id ? `s${send.step_id}` : "m0");
@@ -515,21 +542,23 @@ export async function handleInboundFlow(env: Env, token: string, ev: MetaEvent, 
     .bind(ev.lead_id)
     .all<Trigger>();
   const due = owed.results.find((t) => t.keyword.split(",").some((k) => k.trim() !== "*" && matches(k, text)));
-  if (due && (await startFlow(env, token, due.id, ev.lead_id, now, text))) return true;
-  const { results } = await env.DB.prepare(`SELECT * FROM triggers WHERE enabled = 1 AND deleted_at IS NULL AND source IN (SELECT value FROM json_each(?1)) ORDER BY id`)
-    .bind(JSON.stringify(sources))
-    .all<Trigger>();
+  // Counted on the automation's own DM keyword trigger when it has one for this word, else on the comment trigger.
+  const dueVia = due && (moreOf(due).find((x) => x.source === "dm" && matches(x.keyword, text) && x.keyword.trim() !== "*")?.id ?? "main");
+  if (due && (await startFlow(env, token, due.id, ev.lead_id, now, text, dueVia))) return true;
+  // Every trigger of every live automation: the main one and the When... card's others.
+  const { results } = await env.DB.prepare(`SELECT * FROM triggers WHERE enabled = 1 AND deleted_at IS NULL ORDER BY id`).all<Trigger>();
+  const all = results.flatMap((t) => triggersOf(t).map((c) => ({ t, c })));
   const found = sources
     .flatMap((s) =>
-      results
-        .filter((t) => t.source === s && (s !== "story" || !t.media_id || t.media_id === sig?.storyId))
-        .sort((a, b) => Number(!a.media_id) - Number(!b.media_id)),
+      all
+        .filter(({ c }) => c.source === s && (s !== "story" || !c.media_id || c.media_id === sig?.storyId))
+        .sort((a, b) => Number(!a.c.media_id) - Number(!b.c.media_id)),
     )
-    .find((t) => t.source === "mention" || matches(t.keyword, text));
-  if (found) return startFlow(env, token, found.id, ev.lead_id, now, text);
+    .find(({ c }) => c.source === "mention" || matches(c.keyword, text));
+  if (found) return startFlow(env, token, found.t.id, ev.lead_id, now, text, found.c.id);
   if (!isNew) return false;
   const welcome = await env.DB.prepare(`SELECT id FROM triggers WHERE enabled = 1 AND deleted_at IS NULL AND source = 'welcome' ORDER BY id LIMIT 1`).first<{ id: number }>();
-  return welcome ? startFlow(env, token, welcome.id, ev.lead_id, now, text) : false;
+  return welcome ? startFlow(env, token, welcome.id, ev.lead_id, now, text, "main") : false;
 }
 
 // Postbacks become lead messages ("[tapped] Send me the link") so the thread shows them and they open the 24h
@@ -537,12 +566,68 @@ export async function handleInboundFlow(env: Env, token: string, ev: MetaEvent, 
 export async function handlePostback(env: Env, token: string, pb: Postback, now: number): Promise<void> {
   const known = await db.getLead(env.DB, pb.lead_id);
   const profile = known?.username ? { username: known.username, name: null } : await fetchProfile(token, pb.lead_id);
+  const mid = `pb:${pb.lead_id}:${pb.at}`;
   const fresh = await db.recordInbound(
     env.DB,
-    { subscriber_id: pb.lead_id, username: profile.username, first_name: profile.name, text: `[tapped] ${pb.title}`.trim(), mid: `pb:${pb.lead_id}:${pb.at}` },
+    { subscriber_id: pb.lead_id, username: profile.username, first_name: profile.name, text: `[tapped] ${pb.title}`.trim(), mid, pending: pendingFlow({ tap: pb.payload }, now) },
     pb.at,
   );
-  if (fresh) await handleTap(env, token, pb.lead_id, pb.payload, now).catch((e) => logError(env.DB, "button tap", `${pb.lead_id} ${pb.payload}`, e, now));
+  if (fresh) await finishInbound(env.DB, mid, "button tap", `${pb.lead_id} ${pb.payload}`, now, () => handleTap(env, token, pb.lead_id, pb.payload, now));
+}
+
+// ---------- picking up after a database restart ----------
+
+// No walk runs this long (a webhook gets about 30 s), so a claim still open after it died with the database.
+const STALE_MS = 90_000;
+const DAY_MS = 24 * 60 * 60_000;
+
+// A DM or tap is saved with what its automation needs (messages.flow_pending) in the same write, and that's cleared
+// once the automation has run. If the database restarts in between, resumeInbound runs it from the cron instead of
+// it being lost: Instagram's retry of the webhook would find the message saved and skip it.
+type Pending = { at: number; tap?: string; text?: string; sig?: Signal; isNew?: boolean };
+export const pendingFlow = (p: Omit<Pending, "at">, now: number) => JSON.stringify({ ...p, at: now });
+
+async function finishInbound(d: D1Database, mid: string, kind: string, ref: string, now: number, run: () => Promise<unknown>): Promise<void> {
+  const settle = () => d.prepare(`UPDATE messages SET flow_pending = NULL WHERE mid = ?1`).bind(mid).run();
+  try {
+    await run();
+  } catch (e) {
+    await logError(d, kind, ref, e, now);
+    if (DB_BLIP.test(String(e))) return; // left pending: the cron tries again
+  }
+  await settle().catch(() => {}); // if this fails the cron reruns it, and every start and tap only works once
+}
+
+export const inboundFlow = (env: Env, token: string, ev: MetaEvent, sig: Signal | undefined, isNew: boolean, now: number) =>
+  finishInbound(env.DB, ev.mid, "DM flow", `${ev.lead_id} ${ev.mid}`, now, () => handleInboundFlow(env, token, ev, sig, isNew, now));
+
+// Cron: DMs and taps whose automation the database cut off, and messages left "sending" by one.
+export async function resumeInbound(env: Env, now: number): Promise<number> {
+  await env.DB.prepare(`UPDATE flow_sends SET status = 'failed', error = 'interrupted: the database restarted mid-send' WHERE status = 'sending' AND created_at < ?1`)
+    .bind(now - 10 * 60_000)
+    .run();
+  const { results } = await env.DB.prepare(`SELECT subscriber_id, mid, flow_pending FROM messages WHERE flow_pending IS NOT NULL ORDER BY id LIMIT 50`).all<{
+    subscriber_id: string;
+    mid: string;
+    flow_pending: string;
+  }>();
+  const token = await db.getSetting(env.DB, "ig_token");
+  let n = 0;
+  for (const r of results) {
+    const p = JSON.parse(r.flow_pending) as Pending;
+    if (now - p.at < STALE_MS) continue; // its webhook may still be running
+    if (!token || now - p.at > DAY_MS) {
+      await env.DB.prepare(`UPDATE messages SET flow_pending = NULL WHERE mid = ?1`).bind(r.mid).run();
+      continue;
+    }
+    n++;
+    if (p.tap !== undefined) await finishInbound(env.DB, r.mid, "button tap", `${r.subscriber_id} ${p.tap}`, now, () => handleTap(env, token, r.subscriber_id, p.tap!, now));
+    else {
+      const ev: MetaEvent = { kind: "inbound", lead_id: r.subscriber_id, mid: r.mid, text: p.text ?? "", at: p.at, attachments: [], parts: [], app_id: null };
+      await inboundFlow(env, token, ev, p.sig, Boolean(p.isNew), now);
+    }
+  }
+  return n;
 }
 
 // Cron: smart delays that are due. Cancelled when the lead has said anything since (they're in a live chat now).
@@ -580,7 +665,7 @@ export async function flowClick(env: Env, id: number, button: string | null, now
   const url = button ? (JSON.parse(send?.urls ?? "{}") as Record<string, string>)[button] : send?.url;
   if (!url) return new Response("not found", { status: 404 });
   await env.DB.batch([
-    env.DB.prepare(`INSERT OR IGNORE INTO flow_taps (send_id, port, created_at) VALUES (?1, ?2, ?3)`).bind(id, button ?? "url", now),
+    env.DB.prepare(`INSERT OR IGNORE INTO flow_taps (send_id, port, created_at, done_at) VALUES (?1, ?2, ?3, ?3)`).bind(id, button ?? "url", now),
     env.DB.prepare(`UPDATE flow_sends SET clicked_at = COALESCE(clicked_at, ?2) WHERE id = ?1`).bind(id, now),
   ]);
   return Response.redirect(url, 302);
@@ -655,7 +740,7 @@ export async function testCode(d1: D1Database, triggerId: number, graph: Graph, 
     .bind(shadow, `test of #${triggerId}`, now)
     .run();
   // A comment trigger's first message can only be a private reply to a real comment; in a test it's a plain DM.
-  await publish(d1, shadow, { ...graph, trigger: { ...graph.trigger, source: "none", keyword: "*", media_id: null, public_reply: null } }, now);
+  await publish(d1, shadow, { ...graph, trigger: { ...graph.trigger, source: "none", keyword: "*", media_id: null, public_reply: null }, more: [] }, now);
   await d1.prepare(`UPDATE triggers SET deleted_at = ?2 WHERE id = ?1`).bind(shadow, now).run();
   const { results: taken } = await d1.prepare(`SELECT key FROM settings WHERE key LIKE 'test_code:%'`).all<{ key: string }>();
   const used = new Set(taken.map((r) => r.key.slice(10)));

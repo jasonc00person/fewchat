@@ -70,7 +70,7 @@ export const isTest = (text: string) => /\bsettertest\b/i.test(text);
 // Returns false when this message was already recorded (webhook retry, or the other pipe got it first).
 export async function recordInbound(
   db: D1Database,
-  m: { subscriber_id: string; username: string | null; first_name: string | null; text: string; mid?: string; mc_id?: string },
+  m: { subscriber_id: string; username: string | null; first_name: string | null; text: string; mid?: string; mc_id?: string; pending?: string },
   now: number,
 ): Promise<boolean> {
   // Accounts with a role on the app get each DM down both pipes (Meta webhook and Manychat). Same lead, same
@@ -87,8 +87,8 @@ export async function recordInbound(
     return false;
   }
   const ins = await db
-    .prepare(`INSERT OR IGNORE INTO messages (subscriber_id, role, text, created_at, mid) VALUES (?1, 'lead', ?2, ?3, ?4)`)
-    .bind(m.subscriber_id, m.text, now, m.mid ?? null)
+    .prepare(`INSERT OR IGNORE INTO messages (subscriber_id, role, text, created_at, mid, flow_pending) VALUES (?1, 'lead', ?2, ?3, ?4, ?5)`)
+    .bind(m.subscriber_id, m.text, now, m.mid ?? null, m.pending ?? null)
     .run();
   if (!ins.meta.changes) return false;
   await db.batch([

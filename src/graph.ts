@@ -61,14 +61,27 @@ export interface TriggerCfg {
   media_id: string | null;
   public_reply: string | null;
 }
+// The When... card can hold more than one trigger: `trigger` is the main one (stored in the triggers row's own
+// columns, and the comment trigger whenever there is one), `more` the others: DM keywords, story replies, mentions.
+// Each extra has an id that runs started by it carry (flow_starts.via; the main one is "main"). `auto` = FewChat
+// added it itself (a DM keyword while Instagram was refusing the comment DMs, src/comments.ts).
+export interface ExtraTrigger extends TriggerCfg {
+  id: string;
+  auto?: boolean;
+}
 export interface Graph {
   trigger: TriggerCfg;
+  more: ExtraTrigger[];
   nodes: Node[];
   edges: Edge[];
 }
 
 export const SOURCES: Source[] = ["comment", "dm", "story", "mention", "welcome", "none"];
 export const KEYWORDLESS = new Set<Source>(["mention", "welcome", "none"]);
+// What an extra trigger can be. A comment trigger is always the main one (one per automation), and welcome / none
+// only make sense alone.
+export const EXTRA_SOURCES: Source[] = ["dm", "story", "mention"];
+export const MAX_TRIGGERS = 10;
 export const STAGES = ["opener", "lead", "qualify", "pitch", "link_sent", "joined", "closed"];
 const ACTIONS: ActionItem["type"][] = ["add_tag", "remove_tag", "set_stage", "pause_ai", "resume_ai", "handoff", "start_automation"];
 const FIELDS: Rule["field"][] = ["tag", "stage", "keyword", "follows", "paused"];
@@ -149,16 +162,19 @@ export function ports(n: Node): string[] {
 // only between existing nodes from real ports, one edge per port.
 export function sanitize(input: unknown, fallback: TriggerCfg): Graph {
   const g = (input && typeof input === "object" ? input : {}) as any;
-  const t = g.trigger ?? {};
-  const source: Source = SOURCES.includes(t.source) ? t.source : fallback.source;
-  const media = str(t.media_id, 64).trim() || null;
-  const trigger: TriggerCfg = {
-    source,
-    keyword: KEYWORDLESS.has(source) ? "*" : str(t.keyword ?? fallback.keyword, 500).trim(),
-    // comment: the post (or "next"); story: one story, so only replies to that story run it ("next" is posts only)
-    media_id: source === "comment" || (source === "story" && media !== "next") ? media : null,
-    public_reply: source === "comment" ? str(t.public_reply, 2000).trim() || null : null,
-  };
+  let trigger = cleanTrigger(g.trigger ?? {}, fallback);
+  const more: ExtraTrigger[] = [];
+  const ids = new Set(["main"]);
+  for (const [i, raw] of (arr(g.more).slice(0, MAX_TRIGGERS - 1) as any[]).entries()) {
+    let x: TriggerCfg = cleanTrigger(raw ?? {}, { source: "dm", keyword: "", media_id: null, public_reply: null });
+    // A comment trigger added beside another kind becomes the main one; a second comment trigger can't be added.
+    if (x.source === "comment" && trigger.source !== "comment") [trigger, x] = [x, trigger];
+    if (!EXTRA_SOURCES.includes(x.source)) continue;
+    let id = pid(raw?.id, `t${i + 1}`);
+    if (ids.has(id)) id = `t${i + 1}x${ids.size}`;
+    ids.add(id);
+    more.push(raw?.auto === true ? { ...x, id, auto: true } : { ...x, id });
+  }
   const kinds: Kind[] = ["trigger", "message", "delay", "condition", "action", "randomizer"];
   const seen = new Set<string>();
   const nodes: Node[] = [];
@@ -180,13 +196,41 @@ export function sanitize(input: unknown, fallback: TriggerCfg): Graph {
     used.add(key);
     edges.push({ from: e.from, port: e.port, to: e.to });
   }
-  return { trigger, nodes, edges };
+  return { trigger, more, nodes, edges };
+}
+
+function cleanTrigger(t: any, fallback: TriggerCfg): TriggerCfg {
+  const source: Source = SOURCES.includes(t.source) ? t.source : fallback.source;
+  const media = str(t.media_id, 64).trim() || null;
+  return {
+    source,
+    keyword: KEYWORDLESS.has(source) ? "*" : str(t.keyword ?? fallback.keyword, 500).trim(),
+    // comment: the post (or "next"); story: one story, so only replies to that story run it ("next" is posts only)
+    media_id: source === "comment" || (source === "story" && media !== "next") ? media : null,
+    public_reply: source === "comment" ? str(t.public_reply, 2000).trim() || null : null,
+  };
+}
+
+// The automation's triggers as the runtime matches them: the main one first, then the extras.
+export function triggersOf(t: Pick<Trigger, "source" | "keyword" | "media_id" | "public_reply" | "more">): ExtraTrigger[] {
+  return [{ ...triggerCfg(t), id: "main" }, ...moreOf(t)];
+}
+export function moreOf(t: Pick<Trigger, "more">): ExtraTrigger[] {
+  try {
+    const list = JSON.parse(t.more ?? "[]");
+    return Array.isArray(list) ? list : [];
+  } catch {
+    return [];
+  }
 }
 
 // Problems that block Publish (the draft still saves).
 export function validate(g: Graph): string[] {
   const out: string[] = [];
   if (!KEYWORDLESS.has(g.trigger.source) && !g.trigger.keyword) out.push("When...: add at least one keyword (or * for anything).");
+  g.more.forEach((x, i) => {
+    if (!KEYWORDLESS.has(x.source) && !x.keyword) out.push(`When...: trigger ${i + 2} needs at least one keyword (or * for anything).`);
+  });
   if (!g.edges.some((e) => e.from === "trigger")) out.push("When...: connect it to the first step.");
   let n = 0;
   for (const node of g.nodes) {
@@ -279,12 +323,12 @@ export async function legacyGraph(t: Trigger, steps: LegacyStep[], resolve: (nam
     // The old runtime stopped after a message with a next-step button and went on when it was tapped.
     prev = { id: s.id, port: has && s.m.next_title ? "nx" : "next" };
   }
-  return { trigger: { source: t.source, keyword: t.keyword, media_id: t.media_id, public_reply: t.public_reply }, nodes, edges };
+  return { trigger: { source: t.source, keyword: t.keyword, media_id: t.media_id, public_reply: t.public_reply }, more: [], nodes, edges };
 }
 
 // ---------- storage ----------
 
-export const triggerCfg = (t: Trigger): TriggerCfg => ({ source: t.source, keyword: t.keyword, media_id: t.media_id, public_reply: t.public_reply });
+export const triggerCfg = (t: Pick<Trigger, "source" | "keyword" | "media_id" | "public_reply">): TriggerCfg => ({ source: t.source, keyword: t.keyword, media_id: t.media_id, public_reply: t.public_reply });
 
 export async function findByName(d: D1Database, name: string): Promise<number> {
   const row = await d
@@ -302,6 +346,23 @@ const insertStmts = (d: D1Database, id: number, g: Graph, orIgnore = false) => [
   ),
   ...g.edges.map((e) => d.prepare(`INSERT ${orIgnore ? "OR IGNORE " : ""}INTO flow_edges (trigger_id, from_id, port, to_id) VALUES (?1, ?2, ?3, ?4)`).bind(id, e.from, e.port, e.to)),
 ];
+
+// A DM keyword can start only one automation: a DM is just the word, with no post to tell two apart (a comment
+// keyword can repeat, it's tied to its post). The live automation other than `exceptId` that already answers one of
+// these words, and the word.
+const norm = (k: string) => k.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+export const dmWords = (triggers: TriggerCfg[]): string[] =>
+  triggers.filter((x) => x.source === "dm").flatMap((x) => x.keyword.split(",").map(norm)).filter((k) => k && k !== "*");
+export async function dmKeywordOwner(d: D1Database, exceptId: number, words: string[]): Promise<{ t: Trigger; word: string } | null> {
+  if (!words.length) return null;
+  const { results } = await d.prepare(`SELECT * FROM triggers WHERE enabled = 1 AND deleted_at IS NULL AND id != ?1 ORDER BY id`).bind(exceptId).all<Trigger>();
+  for (const t of results) {
+    const theirs = new Set(dmWords(triggersOf(t)));
+    const word = words.find((w) => theirs.has(w));
+    if (word) return { t, word };
+  }
+  return null;
+}
 
 // Builds the graph of an automation that doesn't have one yet (made by the old builder or the old /admin/triggers
 // form). Deterministic ids + INSERT OR IGNORE, so two webhooks racing on the same automation end up with one graph.
@@ -322,6 +383,7 @@ export async function loadGraph(d: D1Database, t: Trigger): Promise<Graph> {
   const { results: edges } = await d.prepare(`SELECT from_id, port, to_id FROM flow_edges WHERE trigger_id = ?1`).bind(t.id).all<{ from_id: string; port: string; to_id: string }>();
   return {
     trigger: triggerCfg(t),
+    more: moreOf(t),
     nodes: nodes.map((n) => ({ id: n.id, kind: n.kind, x: n.x, y: n.y, data: JSON.parse(n.data) })),
     edges: edges.map((e) => ({ from: e.from_id, port: e.port, to: e.to_id })),
   };
@@ -362,9 +424,9 @@ export async function publish(d: D1Database, id: number, g: Graph, now: number):
     ...insertStmts(d, id, g),
     d
       .prepare(
-        `UPDATE triggers SET source = ?2, keyword = ?3, media_id = ?4, public_reply = ?5, dm = ?6, draft = NULL, enabled = 1, published_at = ?7, updated_at = ?7 WHERE id = ?1`,
+        `UPDATE triggers SET source = ?2, keyword = ?3, media_id = ?4, public_reply = ?5, dm = ?6, more = ?8, draft = NULL, enabled = 1, published_at = ?7, updated_at = ?7 WHERE id = ?1`,
       )
-      .bind(id, t.source, t.keyword, t.media_id, t.public_reply, firstText(g), now),
+      .bind(id, t.source, t.keyword, t.media_id, t.public_reply, firstText(g), now, g.more.length ? JSON.stringify(g.more) : null),
     d
       .prepare(`UPDATE flow_runs SET status = 'cancelled' WHERE trigger_id = ?1 AND status = 'scheduled' AND COALESCE(node_id, '') NOT IN (SELECT value FROM json_each(?2))`)
       .bind(id, JSON.stringify(g.nodes.map((n) => n.id))),

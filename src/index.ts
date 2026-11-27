@@ -10,7 +10,7 @@ import { checkHealth, cronStep, logError, webhookSeen } from "./health";
 import { flowsAdminPost, flowsPage } from "./admin_flows";
 import { consoleRoute } from "./dashboard";
 import { getLead, getSetting, recordInbound, setSetting } from "./db";
-import { flowClick, flowSignals, handleInboundFlow, handlePostback, handleRead, parsePostbacks, parseReads, runDueFlows } from "./flows";
+import { flowClick, flowSignals, handlePostback, handleRead, inboundFlow, parsePostbacks, parseReads, pendingFlow, resumeInbound, runDueFlows } from "./flows";
 import { handleClick } from "./links";
 import { getSubscriber, parseInbound } from "./manychat";
 import { authorizeUrl, exchangeCode, graph, fetchProfile, parseComments, parseMessageUpdates, parseParts, parseReplies, parseSignedRequest, parseWebhook, subscribe, verifySignature } from "./meta";
@@ -55,12 +55,14 @@ async function handleMeta(req: Request, env: Env, ctx: ExecutionContext): Promis
     const known = await getLead(env.DB, ev.lead_id);
     const lookup = !known?.username && token;
     const profile = lookup ? await fetchProfile(token, ev.lead_id) : { username: known?.username ?? null, name: null, pic: null };
-    const fresh = await recordInbound(env.DB, { subscriber_id: ev.lead_id, username: profile.username, first_name: profile.name, text: ev.text, mid: ev.mid }, ev.at);
+    const sig = signals.get(ev.mid);
+    const pending = token ? pendingFlow({ text: ev.text, sig, isNew: !known }, Date.now()) : undefined; // see resumeInbound
+    const fresh = await recordInbound(env.DB, { subscriber_id: ev.lead_id, username: profile.username, first_name: profile.name, text: ev.text, mid: ev.mid, pending }, ev.at);
     if (lookup) await saveProfile(env.DB, ev.lead_id, profile, Date.now());
     if (!fresh) continue;
     // Keyword / story / welcome flows answer instantly; anything they don't cover waits for the AI
     // (autopilot's fast path stands down once a flow reply is the thread's latest message).
-    if (token) await handleInboundFlow(env, token, ev, signals.get(ev.mid), !known, Date.now()).catch((e) => logError(env.DB, "DM flow", `${ev.lead_id} ${ev.mid}`, e));
+    if (token) await inboundFlow(env, token, ev, sig, !known, Date.now());
     ctx.waitUntil(afterInbound(env, ev));
   }
   if (token) for (const pb of parsePostbacks(payload)) await handlePostback(env, token, pb, Date.now());
@@ -266,6 +268,7 @@ export default {
         Promise.all([
           cronStep(e, "setter", Date.now(), () => tick(e, Date.now())),
           cronStep(e, "flow delays", Date.now(), () => runDueFlows(e, Date.now())),
+          cronStep(e, "resume", Date.now(), () => resumeInbound(e, Date.now())), // DMs and taps a database restart cut off
           cronStep(e, "broadcasts", Date.now(), () => runBroadcasts(e, Date.now())), // a few a minute, inside the 24h window only
           cronStep(e, "skool joins", Date.now(), () => syncJoins(e, Date.now())), // new Skool members, matched to their DM lead
           cronStep(e, "skool roster", Date.now(), () => syncRoster(e, Date.now())), // members + churned, so the setter never pitches a customer

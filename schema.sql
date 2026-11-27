@@ -106,7 +106,7 @@ CREATE TABLE IF NOT EXISTS comments (
   media_id TEXT,
   text TEXT NOT NULL,
   trigger_id INTEGER,
-  status TEXT NOT NULL,                     -- ignored | repeat | sent | failed | queued (waiting on the hourly cap or a retry) | expired
+  status TEXT NOT NULL,                     -- new (not matched yet) | ignored | repeat | sent | failed | queued (waiting on the hourly cap or a retry) | expired
   error TEXT,
   created_at INTEGER NOT NULL
 );

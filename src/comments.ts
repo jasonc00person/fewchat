@@ -2,8 +2,9 @@
 // plus an optional public reply under the comment. When the commenter answers the DM, the setter takes over.
 
 import { isTest } from "./db";
-import { alert, logError } from "./health";
+import { alert, DB_BLIP, logError } from "./health";
 import { recordBot, startCommentFlow } from "./flows";
+import { dmKeywordOwner, dmWords, MAX_TRIGGERS, moreOf, type ExtraTrigger } from "./graph";
 import { recentMedia, replyToComment, type MetaComment } from "./meta";
 import { pace, type Env } from "./setter";
 
@@ -22,6 +23,7 @@ export interface Trigger {
   next_title: string | null;
   quick_replies: string | null;
   draft: string | null; // the editor's unpublished graph (JSON)
+  more: string | null; // the When... card's other triggers (JSON ExtraTrigger[], src/graph.ts); NULL = just this one
   folder: string | null;
   updated_at: number | null;
   published_at: number | null;
@@ -100,18 +102,28 @@ const THROTTLE_COOL_MS = 10 * 60_000;
 const sentLastHour = async (db: D1Database, now: number) =>
   (await db.prepare(`SELECT COUNT(*) n FROM comments WHERE sent_at > ?1`).bind(now - HOUR).first<{ n: number }>())?.n ?? 0;
 
+// A comment is saved as 'new' and only becomes 'ignored' once nothing matched it. If the database restarts in between
+// (Cloudflare resets it when a query runs out of CPU), it stays 'new' and drainComments finishes it: Instagram's retry
+// and the backfill would both find it saved and skip it.
 export async function handleComment(db: D1Database, token: string | null, skoolLink: string, c: MetaComment, now: number): Promise<void> {
   const ins = await db
     .prepare(
       `INSERT OR IGNORE INTO comments (comment_id, subscriber_id, username, media_id, text, status, created_at)
-       VALUES (?1, ?2, ?3, ?4, ?5, 'ignored', ?6)`,
+       VALUES (?1, ?2, ?3, ?4, ?5, 'new', ?6)`,
     )
     .bind(c.comment_id, c.lead_id, c.username, c.media_id, c.text, now)
     .run();
   if (!ins.meta.changes) return; // webhook retry, or the backfill already saw it
+  await matchComment(db, token, skoolLink, c, now);
+}
+
+async function matchComment(db: D1Database, token: string | null, skoolLink: string, c: MetaComment, now: number): Promise<void> {
   await lockNextPost(db, token, now, c.media_id).catch((e) => logError(db, "next post lock", c.media_id, e, now));
   const trigger = await findTrigger(db, c);
-  if (!trigger) return;
+  if (!trigger) {
+    await db.prepare(`UPDATE comments SET status = 'ignored' WHERE comment_id = ?1`).bind(c.comment_id).run();
+    return;
+  }
   if ((await sentLastHour(db, now)) >= HOURLY_BUDGET) {
     await db.prepare(`UPDATE comments SET status = 'queued', trigger_id = ?2, retry_at = ?3 WHERE comment_id = ?1`).bind(c.comment_id, trigger.id, now).run();
     return;
@@ -194,14 +206,19 @@ export async function tellRefused(db: D1Database, token: string | null, now: num
   if (!token) return 0;
   const { results } = await db
     .prepare(
-      `SELECT c.comment_id, t.keyword, t.public_reply FROM comments c JOIN triggers t ON t.id = c.trigger_id
+      `SELECT c.comment_id, c.trigger_id, t.keyword, t.public_reply FROM comments c JOIN triggers t ON t.id = c.trigger_id
        WHERE c.status = 'queued' AND c.fallback_at IS NULL AND c.error LIKE '%thread does not exist%' AND c.created_at > ?1
          AND NOT EXISTS (SELECT 1 FROM flow_starts f WHERE f.trigger_id = c.trigger_id AND f.subscriber_id = c.subscriber_id AND f.status = 'sent')
        ORDER BY c.created_at DESC LIMIT 8`,
     )
     .bind(now - REPLY_WINDOW_MS)
-    .all<{ comment_id: string; keyword: string; public_reply: string | null }>();
+    .all<{ comment_id: string; trigger_id: number; keyword: string; public_reply: string | null }>();
   if (!results.length) return 0;
+  for (const id of new Set(results.map((r) => r.trigger_id))) {
+    const r = results.find((x) => x.trigger_id === id)!;
+    const kw = offer(r);
+    if (kw) await addDmTrigger(db, id, kw, now).catch((e) => logError(db, "auto DM trigger", String(id), e, now));
+  }
   for (const r of results) {
     const kw = offer(r);
     if (kw) {
@@ -211,6 +228,30 @@ export async function tellRefused(db: D1Database, token: string | null, now: num
     await db.prepare(`UPDATE comments SET fallback_at = ?2 WHERE comment_id = ?1`).bind(r.comment_id, kw ? now : 0).run();
   }
   return results.length;
+}
+
+// The public reply above tells people to DM the keyword, so while Instagram refuses an automation's comment DMs it
+// gets a DM keyword trigger for that word, unless a live automation already answers it (a DM keyword starts only one,
+// graph.ts dmKeywordOwner). People who DM it without commenting (they read the reply under someone else's comment)
+// then get it too, and every run counts on the one card. Marked auto in the When... card; it stays until removed.
+export async function addDmTrigger(db: D1Database, id: number, kw: string, now: number): Promise<boolean> {
+  const t = await db.prepare(`SELECT * FROM triggers WHERE id = ?1 AND enabled = 1 AND deleted_at IS NULL`).bind(id).first<Trigger>();
+  const words = dmWords([{ source: "dm", keyword: kw, media_id: null, public_reply: null }]);
+  if (!t || (await dmKeywordOwner(db, -1, words))) return false;
+  const more = moreOf(t);
+  if (more.length >= MAX_TRIGGERS - 1) return false;
+  const taken = new Set(more.map((x) => x.id));
+  const extra: ExtraTrigger = { source: "dm", keyword: kw.toUpperCase(), media_id: null, public_reply: null, id: ["auto", "auto2", "auto3"].find((x) => !taken.has(x)) ?? `auto${now}`, auto: true };
+  // An unpublished draft gets it too, or publishing that draft would drop it.
+  let draft = t.draft;
+  try {
+    if (draft) draft = JSON.stringify({ ...JSON.parse(draft), more: [...((JSON.parse(draft).more as ExtraTrigger[] | undefined) ?? []), extra] });
+  } catch {
+    /* a broken draft is replaced by the live graph when the editor opens it */
+  }
+  await db.prepare(`UPDATE triggers SET more = ?2, draft = ?3 WHERE id = ?1`).bind(id, JSON.stringify([...more, extra]), draft).run();
+  console.log(`automation ${id}: added DM keyword ${extra.keyword} (Instagram is refusing its comment DMs)`);
+  return true;
 }
 
 // The comments refused before the reply above existed (fallback_at = -1, held by hand on 2026-11-27) get it slowly, with
@@ -257,6 +298,8 @@ export async function tellBacklog(env: Env, token: string | null, now: number, r
         await db.prepare(`UPDATE comments SET fallback_at = 0 WHERE comment_id = ?1`).bind(r.comment_id).run();
         return false;
       }
+      // Our own database restarting isn't Instagram pushing back: try again next minute.
+      if (DB_BLIP.test(String(e))) return false;
       await db.prepare(`INSERT INTO settings (key, value) VALUES ('backlog_replies_paused_until', ?1) ON CONFLICT (key) DO UPDATE SET value = excluded.value`).bind(String(now + 24 * HOUR)).run();
       await logError(db, "backlog public reply", r.comment_id, e, now);
       await alert(env, "backlog_replies", "backlog replies stopped", `Instagram refused a public reply, so the catch-up replies are paused for 24h: ${String(e).slice(0, 300)}`, now);
@@ -270,7 +313,14 @@ export async function tellBacklog(env: Env, token: string | null, now: number, r
 // Cron: send queued private replies, oldest first, inside what's left of the hour's budget (at most 40 a minute so a
 // backlog drains steadily instead of in one burst). Past the 7-day window they expire.
 export async function drainComments(db: D1Database, token: string | null, skoolLink: string, now: number): Promise<number> {
-  await db.prepare(`UPDATE comments SET status = 'expired' WHERE status = 'queued' AND created_at < ?1`).bind(now - REPLY_WINDOW_MS).run();
+  await db.prepare(`UPDATE comments SET status = 'expired' WHERE status IN ('queued', 'new') AND created_at < ?1`).bind(now - REPLY_WINDOW_MS).run();
+  // Comments a database restart cut off before they were matched (see handleComment). Not the last 90 s: their webhook
+  // may still be running.
+  const { results: cut } = await db
+    .prepare(`SELECT comment_id, subscriber_id, username, media_id, text FROM comments WHERE status = 'new' AND created_at < ?1 ORDER BY created_at LIMIT 20`)
+    .bind(now - 90_000)
+    .all<{ comment_id: string; subscriber_id: string; username: string | null; media_id: string | null; text: string }>();
+  for (const r of cut) await matchComment(db, token, skoolLink, { comment_id: r.comment_id, lead_id: r.subscriber_id, username: r.username, media_id: r.media_id, text: r.text }, now);
   await tellRefused(db, token, now).catch((e) => logError(db, "refused comment reply", null, e, now));
   const room = Math.min(40, HOURLY_BUDGET - (await sentLastHour(db, now)));
   if (room <= 0) return 0;

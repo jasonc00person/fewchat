@@ -5,7 +5,8 @@ vi.mock("../src/brain", async (orig) => ({ ...(await orig<typeof import("../src/
 
 import { decide } from "../src/brain";
 import * as db from "../src/db";
-import { buildMessage, flowTypingMs, ORIGIN, runDueFlows } from "../src/flows";
+import { drainComments } from "../src/comments";
+import { buildMessage, flowTypingMs, ORIGIN, resumeInbound, runDueFlows } from "../src/flows";
 import worker from "../src/index";
 import { hmacHex } from "../src/meta";
 import { pace, tick, type Env } from "../src/setter";
@@ -464,3 +465,103 @@ describe("ice breakers and main menu", () => {
   });
 });
 
+
+// Cloudflare resets the database when a query runs out of CPU (a heavy lookup, say). From the first statement matching
+// `tripOn` until heal(), every query fails the way it does then.
+function restarting(env: Env) {
+  const real = env.DB;
+  let down = false;
+  let trip: RegExp | null = null;
+  const check = (sql: string) => {
+    if (trip?.test(sql)) [down, trip] = [true, null];
+    if (down) throw new Error("D1_ERROR: D1 DB exceeded its CPU time limit and was reset.");
+  };
+  const wrap = (st: any, sql: string): any => ({
+    bind: (...p: unknown[]) => wrap(st.bind(...p), sql),
+    run: async () => (check(sql), st.run()),
+    first: async (...a: unknown[]) => (check(sql), st.first(...a)),
+    all: async () => (check(sql), st.all()),
+    raw: async (...a: unknown[]) => (check(sql), st.raw(...a)),
+    stmt: st,
+    sql,
+  });
+  env.DB = {
+    ...real,
+    prepare: (sql: string) => wrap(real.prepare(sql), sql),
+    batch: async (stmts: any[]) => {
+      for (const x of stmts) check(x.sql);
+      return real.batch(stmts.map((x) => x.stmt));
+    },
+  } as unknown as D1Database;
+  return { tripOn: (re: RegExp) => void (trip = re), heal: () => void ([down, trip] = [false, null]) };
+}
+
+describe("a database restart mid-way", () => {
+  const commentStatus = async (env: Env) => (await env.DB.prepare(`SELECT status FROM comments WHERE comment_id = 'c1'`).first<{ status: string }>())?.status;
+  const privateReplies = () => sends().filter((c) => c.body.recipient.comment_id);
+
+  it("a comment cut off before it was matched is finished by the cron, not left ignored", async () => {
+    const env = await connected();
+    await addAuto(env, { source: "comment", keyword: "guide", dm: "here u go", media_id: "reel1" });
+    const d = restarting(env);
+    d.tripOn(/FROM triggers/);
+    await post(env, comment("guide pls"));
+    d.heal();
+    expect(await commentStatus(env)).toBe("new");
+    await post(env, comment("guide pls")); // Instagram's retry finds it saved
+    await drainComments(env.DB, "tok", LINK, Date.now() + 30_000); // too soon: its webhook could still be running
+    expect(privateReplies()).toHaveLength(0);
+    await drainComments(env.DB, "tok", LINK, Date.now() + 2 * MIN);
+    expect(privateReplies()).toHaveLength(1);
+    expect(await commentStatus(env)).toBe("sent");
+  });
+
+  it("a run cut off after it claimed the person retries once it's stale, instead of reading as already sent", async () => {
+    const env = await connected();
+    await addAuto(env, { source: "comment", keyword: "guide", dm: "here u go", media_id: "reel1" });
+    const d = restarting(env);
+    d.tripOn(/INSERT INTO flow_sends/);
+    await post(env, comment("guide"));
+    d.heal();
+    expect(await env.DB.prepare(`SELECT status FROM flow_starts`).first<{ status: string }>()).toEqual({ status: "sending" });
+    await drainComments(env.DB, "tok", LINK, Date.now() + 2 * MIN);
+    expect(privateReplies()).toHaveLength(1);
+    expect(await commentStatus(env)).toBe("sent");
+  });
+
+  it("a DM keyword cut off before its automation ran gets it from the cron, once", async () => {
+    const env = await connected();
+    await addAuto(env, { source: "dm", keyword: "guide", dm: "here u go" });
+    const d = restarting(env);
+    d.tripOn(/SELECT \* FROM triggers WHERE enabled = 1 AND deleted_at IS NULL ORDER BY id/);
+    await post(env, dm("m1", { text: "guide" }));
+    d.heal();
+    expect(sent().filter((m) => m?.text === "here u go")).toHaveLength(0);
+    expect(await resumeInbound(env, Date.now() + 30_000)).toBe(0); // too soon
+    expect(await resumeInbound(env, Date.now() + 2 * MIN)).toBe(1);
+    expect(await resumeInbound(env, Date.now() + 3 * MIN)).toBe(0);
+    expect(sent().filter((m) => m?.text === "here u go")).toHaveLength(1);
+
+    await post(env, dm("m2", { text: "guide again" })); // a normal run leaves nothing behind for the cron
+    expect(await resumeInbound(env, Date.now() + 5 * MIN)).toBe(0);
+  });
+
+  it("a button tap cut off mid-walk is finished by the cron, and the button still works only once", async () => {
+    const env = await connected();
+    const id = await addAuto(env, { keyword: "whop", dm: "tap below for the guide", next_title: "Send the Link!" });
+    await addStep(env, id, 0, { text: "here it is" });
+    await post(env, dm("m1", { text: "whop" }));
+    const d = restarting(env);
+    d.tripOn(/INSERT INTO flow_sends/);
+    await post(env, tap("Send the Link!", "b:1:nx"));
+    d.heal();
+    expect(sent().filter((m) => m?.text === "here it is")).toHaveLength(0);
+    await post(env, tap("Send the Link!", "b:1:nx")); // a quick second tap doesn't jump the queue
+    expect(sent().filter((m) => m?.text === "here it is")).toHaveLength(0);
+    await resumeInbound(env, Date.now() + 2 * MIN);
+    expect(sent().filter((m) => m?.text === "here it is")).toHaveLength(1);
+    await resumeInbound(env, Date.now() + 3 * MIN);
+    await post(env, tap("Send the Link!", "b:1:nx"));
+    expect(sent().filter((m) => m?.text === "here it is")).toHaveLength(1);
+  });
+});
