@@ -241,6 +241,9 @@ describe("comment-to-DM", () => {
     const live = { object: "instagram", entry: [{ id: ME, changes: [{ field: "live_comments", value: { id: "l1", text: "yo", from: { id: LEAD } } }] }] };
     expect(parseComments(live)).toHaveLength(1);
     expect(parseComments(msg({ mid: "m1", text: "hey" }))).toEqual([]);
+    // Unified login's payload names the comment comment_id
+    const unified = { object: "instagram", entry: [{ id: ME, changes: [{ field: "comments", value: { comment_id: "u1", text: "AI pls", from: { id: LEAD, username: "lead.handle" }, media: { id: "reel1" } } }] }] };
+    expect(parseComments(unified)).toEqual([{ comment_id: "u1", lead_id: LEAD, username: "lead.handle", media_id: "reel1", text: "AI pls" }]);
   });
 
   it("matches whole words and phrases, any case", () => {

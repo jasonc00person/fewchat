@@ -12,7 +12,7 @@ import { customerLine } from "./roster";
 import { ping } from "./live";
 import { enrichPending } from "./media";
 import { findByIgId, sendBubbles } from "./manychat";
-import { react, refreshToken, senderAction, sendText } from "./meta";
+import { react, refreshToken, senderAction, sendText, unifiedLogin } from "./meta";
 import { meter } from "./usage";
 
 export interface Env {
@@ -28,8 +28,9 @@ export interface Env {
   REPLY_DELAY_MIN_S: string;
   REPLY_DELAY_MAX_S: string;
   TRANSPORT: string; // "meta" | "manychat"
-  META_IG_APP_ID: string;
-  META_APP_SECRET: string; // Instagram app secret (API setup with Instagram login)
+  META_IG_APP_ID: string; // Unified login: the Meta app's own id
+  META_APP_SECRET: string; // Instagram app secret (API setup with Instagram login); Unified login: the Meta app secret
+  META_LOGIN_CONFIG_ID?: string; // set = Unified login (src/meta.ts): the Facebook Login for Business configuration id
   META_VERIFY_TOKEN: string;
   SKOOL_AUTH_TOKEN?: string;
   ALERT_TOPIC?: string; // ntfy.sh topic for phone alerts (src/health.ts) // The owner's Skool auth_token cookie (one-year JWT): reads new members for join matching
@@ -292,7 +293,7 @@ async function heart(env: Env, lead: db.Lead, messageId: number): Promise<void> 
 async function keepTokenFresh(env: Env, now: number): Promise<void> {
   const token = await db.getSetting(env.DB, "ig_token");
   const at = Number((await db.getSetting(env.DB, "ig_token_at")) ?? 0);
-  if (!token || now - at < TOKEN_REFRESH_MS) return;
+  if (!token || now - at < TOKEN_REFRESH_MS || unifiedLogin()) return; // a Unified login token can't be refreshed
   await db.setSetting(env.DB, "ig_token", await refreshToken(token));
   await db.setSetting(env.DB, "ig_token_at", String(now));
 }

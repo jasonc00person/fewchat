@@ -3,6 +3,7 @@ import { makeD1 } from "./d1shim";
 import * as db from "../src/db";
 import worker from "../src/index";
 import { hasSession, sessionCookie } from "../src/session";
+import { graph, useLogin } from "../src/meta";
 import type { Env } from "../src/setter";
 
 const OWNER = "17840000000000001";
@@ -175,5 +176,96 @@ describe("password form", () => {
     expect(hop.headers.get("Location")).toBe("https://x/login");
     const desk = await (await worker.fetch(new Request("https://x/login"), env, ctx)).text();
     expect(desk.indexOf("Log in with Instagram")).toBeLessThan(desk.indexOf('autocomplete="current-password"'));
+  });
+});
+
+describe("Unified login (Meta apps created since late October 2026)", () => {
+  const ACCT = "17841499999999999";
+  let accounts: { id: string; username?: string }[] = [];
+  let handle = "";
+  const unifiedEnv = (): Env => ({ ...makeEnv(), META_IG_APP_ID: "1234567890", META_LOGIN_CONFIG_ID: "cfg42" });
+  beforeEach(async () => {
+    handle = (await (await worker.fetch(new Request("https://x/login"), makeEnv(), ctx)).text()).match(/name="username"[^>]*value="([^"]+)"/)![1];
+    accounts = [{ id: ACCT, username: handle }];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        calls.push(url);
+        if (url.includes("graph.facebook.com/v26.0/oauth/access_token")) return Response.json({ access_token: "suat" });
+        if (url.includes("graph.facebook.com/v26.0/me/assigned_instagram_accounts")) return Response.json({ data: accounts });
+        return Response.json({});
+      }),
+    );
+  });
+  afterEach(() => useLogin(false, null));
+
+  it("logs in through the configuration, claims the account it was set up for, and calls graph.facebook.com with its id", async () => {
+    const env = unifiedEnv();
+    const start = await worker.fetch(new Request("https://x/auth/login"), env, ctx);
+    const to = new URL(start.headers.get("Location")!);
+    expect(to.origin + to.pathname).toBe("https://www.facebook.com/dialog/oauth");
+    expect(to.searchParams.get("config_id")).toBe("cfg42");
+    expect(to.searchParams.get("client_id")).toBe("1234567890");
+    expect(to.searchParams.get("scope")).toBeNull();
+
+    const res = await loginFlow(env);
+    expect(res.status).toBe(303);
+    expect(await hasSession(withCookie("/admin/dashboard", cookieOf(res)), env)).toBe(true);
+    expect(await db.getSetting(env.DB, "ig_account_id")).toBe(ACCT);
+    expect(await db.getSetting(env.DB, "ig_token")).toBe("suat");
+    expect(calls.some((u) => u.startsWith(`https://graph.facebook.com/v26.0/${ACCT}/subscribed_apps?`))).toBe(true);
+    expect(calls.some((u) => u.includes("graph.instagram.com") || u.includes("api.instagram.com"))).toBe(false);
+
+    // Later requests address the account by id on graph.facebook.com (the console refreshes its profile from /me).
+    calls = [];
+    await worker.fetch(withCookie("/admin/dashboard", cookieOf(res)), env, ctx);
+    expect(calls.some((u) => u.startsWith(`https://graph.facebook.com/v26.0/${ACCT}?fields=`))).toBe(true);
+    expect(calls.some((u) => u.includes("graph.instagram.com"))).toBe(false);
+  });
+
+  it("turns away a login that shares another account, or none, with a reason", async () => {
+    const env = unifiedEnv();
+    accounts = [{ id: "17841400000000001", username: "someone.else" }];
+    expect(await (await loginFlow(env)).text()).toContain(`set up for @${handle}`);
+    accounts = [];
+    expect(await (await loginFlow(env)).text()).toContain("business_management");
+    expect(await db.getSetting(env.DB, "ig_token")).toBeNull();
+    // Once claimed, only that account gets in, even if the login also shares others.
+    await db.setSetting(env.DB, "ig_account_id", ACCT);
+    accounts = [{ id: "17841400000000001", username: handle }];
+    expect(await (await loginFlow(env)).text()).toContain("the one this setter runs");
+    accounts = [{ id: "17841400000000001" }, { id: ACCT }];
+    expect((await loginFlow(env)).status).toBe(303);
+  });
+
+  it("an install without the configuration id stays on Instagram Login", async () => {
+    const env = makeEnv();
+    const start = await worker.fetch(new Request("https://x/auth/login"), env, ctx);
+    expect(start.headers.get("Location")).toContain("https://www.instagram.com/oauth/authorize?");
+  });
+});
+
+describe("graph()", () => {
+  afterEach(() => useLogin(false, null));
+  it("rewrites /me and paging links for Unified login, and leaves Instagram Login as it was", async () => {
+    const seen: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => (seen.push(url), Response.json({ ok: true }))));
+    await graph("/me/messages", { method: "POST" });
+    await graph("/me?fields=user_id");
+    useLogin(true, "1784");
+    await graph("/me/messages", { method: "POST" });
+    await graph("/me?fields=username");
+    await graph("/media123/comments?limit=50");
+    await graph("https://graph.facebook.com/v26.0/1784/conversations?after=abc");
+    await graph("/messenger_profile_x"); // only "/me" itself is the account, not anything that starts with it
+    expect(seen).toEqual([
+      "https://graph.instagram.com/v26.0/me/messages",
+      "https://graph.instagram.com/v26.0/me?fields=user_id",
+      "https://graph.facebook.com/v26.0/1784/messages",
+      "https://graph.facebook.com/v26.0/1784?fields=username",
+      "https://graph.facebook.com/v26.0/media123/comments?limit=50",
+      "https://graph.facebook.com/v26.0/1784/conversations?after=abc",
+      "https://graph.facebook.com/v26.0/messenger_profile_x",
+    ]);
   });
 });

@@ -1,10 +1,23 @@
-// Official Instagram API (Instagram Login) transport: webhooks in, Send API out, business-login OAuth
-// for the token. App: FewChat (Instagram app id in META_IG_APP_ID).
+// Official Instagram API transport: webhooks in, Send API out, OAuth for the token. App: FewChat (its id in META_IG_APP_ID).
+//
+// Two logins reach the same API. Instagram Login (business login; apps set up before Meta closed it to new apps in late
+// October 2026): graph.instagram.com, and the account is "me". Unified login (every app created since, switched on by
+// META_LOGIN_CONFIG_ID): a Facebook Login for Business configuration hands out a business system-user token that only
+// works on graph.facebook.com, with the account's own id in place of "me". Same paths otherwise, so every call goes
+// through graph() and useLogin() says which one this install runs.
 
 import type { MessageUpdate, Part } from "./attachments";
 
-const GRAPH = "https://graph.instagram.com/v26.0";
+const IG_GRAPH = "https://graph.instagram.com/v26.0";
+const FB_GRAPH = "https://graph.facebook.com/v26.0";
 export const SCOPES = "instagram_business_basic,instagram_business_manage_messages,instagram_business_manage_comments";
+
+// One account per install, so this is per install: every entry point sets it (src/index.ts) before any call.
+let api = { base: IG_GRAPH, me: "me" };
+export function useLogin(unified: boolean, accountId: string | null): void {
+  api = unified ? { base: FB_GRAPH, me: accountId ?? "me" } : { base: IG_GRAPH, me: "me" };
+}
+export const unifiedLogin = () => api.base === FB_GRAPH;
 
 export async function hmacHex(secret: string, body: string): Promise<string> {
   const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
@@ -249,7 +262,7 @@ export interface MetaComment {
 
 interface RawChange {
   field?: string;
-  value?: { id?: string; text?: string; from?: { id?: string; username?: string }; media?: { id?: string } };
+  value?: { id?: string; comment_id?: string; text?: string; from?: { id?: string; username?: string }; media?: { id?: string } };
 }
 
 // "comments" and "live_comments" webhook changes. Skips the account's own comments (including our public replies).
@@ -260,16 +273,19 @@ export function parseComments(payload: unknown): MetaComment[] {
   for (const entry of p.entry) {
     for (const ch of entry.changes ?? []) {
       const v = ch.value;
-      if ((ch.field !== "comments" && ch.field !== "live_comments") || !v?.id || !v.from?.id || !v.text) continue;
+      const id = v?.id ?? v?.comment_id; // Unified login's payload calls it comment_id
+      if ((ch.field !== "comments" && ch.field !== "live_comments") || !id || !v?.from?.id || !v.text) continue;
       if (v.from.id === entry.id) continue;
-      out.push({ comment_id: v.id, lead_id: v.from.id, username: v.from.username ?? null, media_id: v.media?.id ?? null, text: v.text });
+      out.push({ comment_id: id, lead_id: v.from.id, username: v.from.username ?? null, media_id: v.media?.id ?? null, text: v.text });
     }
   }
   return out;
 }
 
 export async function graph<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${GRAPH}${path}`, init);
+  // Paging links come back as full URLs on either host; "/me" is the account under Unified login.
+  const rel = path.replace(/^https:\/\/graph\.(instagram|facebook)\.com\/v[\d.]+/, "").replace(/^\/me(?=[/?]|$)/, `/${api.me}`);
+  const res = await fetch(`${api.base}${rel}`, init);
   const body = (await res.json().catch(() => ({}))) as T & { error?: { message?: string; code?: number } };
   if (!res.ok || body.error) throw new Error(`instagram ${res.status}${body.error?.code ? ` code ${body.error.code}` : ""}: ${body.error?.message ?? "request failed"}`);
   return body;
@@ -369,9 +385,24 @@ export async function fetchAccount(token: string): Promise<Account> {
   return graph<Account>(`/me?fields=username,name,profile_picture_url`, { headers: { Authorization: `Bearer ${token}` } });
 }
 
-export function authorizeUrl(appId: string, redirectUri: string, state: string): string {
+// Unified login: the configuration carries the permissions and the account picker, so there's no scope here.
+export function authorizeUrl(appId: string, redirectUri: string, state: string, configId?: string): string {
+  if (configId) return `https://www.facebook.com/dialog/oauth?${new URLSearchParams({ client_id: appId, config_id: configId, redirect_uri: redirectUri, response_type: "code", state })}`;
   const q = new URLSearchParams({ client_id: appId, redirect_uri: redirectUri, response_type: "code", scope: SCOPES, state });
   return `https://www.instagram.com/oauth/authorize?${q}`;
+}
+
+// Unified login: the code gives the final token (it lasts as long as the configuration says; no refresh exists), and
+// the token names no account: the ones the login granted are listed separately. That list comes back empty unless
+// the configuration also has business_management.
+export async function exchangeUnified(appId: string, secret: string, redirectUri: string, code: string): Promise<{ token: string; accounts: { id: string; username?: string }[] }> {
+  const r = await fetch(`${FB_GRAPH}/oauth/access_token?${new URLSearchParams({ client_id: appId, client_secret: secret, redirect_uri: redirectUri, code })}`);
+  const body = (await r.json().catch(() => ({}))) as { access_token?: string; error?: { message?: string } };
+  if (!body.access_token) throw new Error(`oauth: ${body.error?.message ?? r.status}`);
+  const a = await fetch(`${FB_GRAPH}/me/assigned_instagram_accounts?fields=id,username`, { headers: { Authorization: `Bearer ${body.access_token}` } });
+  const list = (await a.json().catch(() => ({}))) as { data?: { id: string; username?: string }[]; error?: { message?: string } };
+  if (!a.ok || list.error) throw new Error(`instagram accounts: ${list.error?.message ?? a.status}`);
+  return { token: body.access_token, accounts: list.data ?? [] };
 }
 
 // code -> short-lived token -> 60-day token. Returns the long-lived token and the account's user id.

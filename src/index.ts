@@ -13,7 +13,7 @@ import { getLead, getSetting, recordInbound, setSetting } from "./db";
 import { flowClick, flowSignals, handlePostback, handleRead, inboundFlow, parsePostbacks, parseReads, pendingFlow, resumeInbound, runDueFlows } from "./flows";
 import { handleClick } from "./links";
 import { getSubscriber, parseInbound } from "./manychat";
-import { authorizeUrl, exchangeCode, graph, fetchProfile, parseComments, parseMessageUpdates, parseParts, parseReplies, parseSignedRequest, parseWebhook, subscribe, verifySignature } from "./meta";
+import { authorizeUrl, exchangeCode, exchangeUnified, graph, fetchProfile, parseComments, parseMessageUpdates, parseParts, parseReplies, parseSignedRequest, parseWebhook, subscribe, useLogin, verifySignature } from "./meta";
 import { applyUpdate, mediaRoute, saveParts, saveReplyTo } from "./attachments";
 import { legalPage } from "./pages";
 import { saveProfile } from "./profiles";
@@ -77,6 +77,23 @@ async function handleMeta(req: Request, env: Env, ctx: ExecutionContext): Promis
   return new Response("ok");
 }
 
+// Which login this install runs (src/meta.ts), set before anything calls Instagram. Instagram Login reads nothing for it.
+async function login(env: Env): Promise<void> {
+  useLogin(Boolean(env.META_LOGIN_CONFIG_ID), env.META_LOGIN_CONFIG_ID ? await getSetting(env.DB, "ig_account_id") : null);
+}
+
+// Unified login: the login can grant several accounts and an install runs one, so take the one it already runs, else
+// the one it was set up for (brand.ts). A string is what to tell the person instead.
+async function pickUnified(env: Env, redirectUri: string, code: string): Promise<{ token: string; userId: string; me: { user_id: string; username?: string } } | string> {
+  const { token, accounts } = await exchangeUnified(env.META_IG_APP_ID, env.META_APP_SECRET, redirectUri, code);
+  if (!accounts.length) return "Meta didn't share an Instagram account with FewChat. Log in again and tick your account when Meta asks. If it never asks, the login configuration is missing business_management (MY-SETUP.md).";
+  const owner = await getSetting(env.DB, "ig_account_id");
+  const acct = accounts.find((a) => (owner ? a.id === owner : (a.username ?? "").toLowerCase() === IG_HANDLE.toLowerCase()));
+  if (!acct) return owner ? "That Instagram account isn't the one this setter runs." : `This FewChat is set up for @${IG_HANDLE}. Log in again and pick that account.`;
+  useLogin(true, acct.id);
+  return { token, userId: acct.id, me: { user_id: acct.id, username: acct.username } };
+}
+
 const STATE_COOKIE = "dms_oauth";
 // Every callback answer drops the one-time state cookie.
 function withCleared(res: Response): Response {
@@ -98,7 +115,7 @@ async function handleAuth(req: Request, env: Env, pathname: string): Promise<Res
     const state = `${pathname === "/auth/login" ? "login:" : ""}${crypto.randomUUID()}`;
     return new Response(null, {
       status: 302,
-      headers: { Location: authorizeUrl(env.META_IG_APP_ID, redirectUri, state), "Set-Cookie": `${STATE_COOKIE}=${state}; Path=/auth; HttpOnly; Secure; SameSite=Lax; Max-Age=900` },
+      headers: { Location: authorizeUrl(env.META_IG_APP_ID, redirectUri, state, env.META_LOGIN_CONFIG_ID), "Set-Cookie": `${STATE_COOKIE}=${state}; Path=/auth; HttpOnly; Secure; SameSite=Lax; Max-Age=900` },
     });
   }
   // /auth/callback
@@ -111,11 +128,13 @@ async function handleAuth(req: Request, env: Env, pathname: string): Promise<Res
   }
   const login = state.startsWith("login:");
   try {
-    const { token, userId } = await exchangeCode(env.META_IG_APP_ID, env.META_APP_SECRET, redirectUri, code.replace(/#_$/, ""));
+    const unified = env.META_LOGIN_CONFIG_ID ? await pickUnified(env, redirectUri, code.replace(/#_$/, "")) : null;
+    if (typeof unified === "string") return withCleared(loginPage(unified, req));
+    const { token, userId } = unified ?? (await exchangeCode(env.META_IG_APP_ID, env.META_APP_SECRET, redirectUri, code.replace(/#_$/, "")));
     if (login) {
       // Compare Instagram account ids from /me: OAuth's user_id is app-scoped and arrives as a lossy JSON number.
       const owner = await ownerId(env).catch(() => null);
-      const me = await graph<{ user_id: string; username?: string }>(`/me?fields=user_id,username`, { headers: { Authorization: `Bearer ${token}` } });
+      const me = unified?.me ?? (await graph<{ user_id: string; username?: string }>(`/me?fields=user_id,username`, { headers: { Authorization: `Bearer ${token}` } }));
       const who = me.user_id;
       if (owner && who !== owner) return withCleared(loginPage("That Instagram account isn't the one this setter runs.", req));
       // The very first sign-in on a fresh install claims it, so only the account it was set up for (brand.ts) may.
@@ -143,6 +162,7 @@ async function handleAuth(req: Request, env: Env, pathname: string): Promise<Res
     await setSetting(env.DB, "ig_token", token);
     await setSetting(env.DB, "ig_token_at", String(Date.now()));
     await setSetting(env.DB, "ig_user_id", userId);
+    if (unified) await setSetting(env.DB, "ig_account_id", userId); // every later request addresses the account by it
     await subscribe(token);
   } catch (e) {
     console.error("instagram login/connect failed:", e);
@@ -166,6 +186,7 @@ async function handleRevoke(req: Request, env: Env, pathname: string): Promise<R
 // gets a page that retries itself, everything else a 503 (Meta retries webhooks on a non-2xx).
 async function guarded(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   try {
+    await login(env);
     return await route(req, env, ctx);
   } catch (e) {
     const { pathname } = new URL(req.url);
@@ -257,13 +278,14 @@ export default {
   fetch: guarded,
 
   async queue(batch: MessageBatch<SendJob>, env: Env): Promise<void> {
+    await login(env);
     await runSendJobs(await withSettings(env), batch.messages.map((m) => m.body));
     batch.ackAll();
   },
 
   async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
     ctx.waitUntil(
-      withSettings(env).then((e) =>
+      Promise.all([withSettings(env), login(env)]).then(([e]) =>
         // Each step on its own: one failing never stops the rest, and five failures in a row text the owner.
         Promise.all([
           cronStep(e, "setter", Date.now(), () => tick(e, Date.now())),

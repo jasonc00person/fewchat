@@ -133,6 +133,10 @@ const BLANK = {
   cloudflare_account_id: "",
   database_id: "",
   instagram_app_id: "",
+  // "unified" (every Meta app created since late October 2026) or "instagram" (older apps that still offer
+  // API setup with Instagram login). Empty = decided by basics(): an install that already has an app id is "instagram".
+  login: "",
+  login_config_id: "",
   url: "",
 };
 // A copy of FewChat from before this installer kept its settings inside wrangler.jsonc and src/brand.ts themselves.
@@ -217,6 +221,7 @@ function build(c) {
     .replaceAll('"queue": "fewchat-send"', `"queue": ${ts(`${name}-send`)}`);
   if (c.database_id) w = w.replace("REPLACE_D1_DATABASE_ID", c.database_id);
   if (c.instagram_app_id) w = w.replace("REPLACE_INSTAGRAM_APP_ID", c.instagram_app_id);
+  if (c.login === "unified") w = w.replace('"META_LOGIN_CONFIG_ID": ""', `"META_LOGIN_CONFIG_ID": ${ts(c.login_config_id || "REPLACE_LOGIN_CONFIG_ID")}`);
   if (c.link) w = w.replace("https://REPLACE_YOUR_LINK", c.link);
   writeIfChanged(at("wrangler.jsonc"), `// BUILT by \`npm run setup\` from templates/wrangler.jsonc and fewchat.config.json. Edit those, not this file.\n${w}`);
 
@@ -479,9 +484,11 @@ function settings(c) {
   const r = sql(c, `SELECT key, value FROM settings WHERE key IN ('ig_token', 'ig_token_at', 'ig_account_id', 'webhook_at', 'ig_profile')`);
   return r.ok ? Object.fromEntries(r.rows.map((x) => [x.key, x.value])) : null;
 }
-async function instagram(token, path) {
+// Unified login's token only works on graph.facebook.com, with the account's id in place of "me" (src/meta.ts).
+async function instagram(c, s, path) {
+  const url = c.login === "unified" ? `https://graph.facebook.com/v26.0${path.replace(/^\/me(?=[/?]|$)/, `/${s.ig_account_id}`)}` : `https://graph.instagram.com/v26.0${path}`;
   try {
-    const res = await fetch(`https://graph.instagram.com/v26.0${path}`, { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(15_000) });
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${s.ig_token}` }, signal: AbortSignal.timeout(15_000) });
     return await res.json();
   } catch {
     return null;
@@ -497,16 +504,33 @@ const ago = (ms) => {
 const WEBHOOK_FIELDS = ["messages", "messaging_postbacks", "messaging_seen", "messaging_referral", "message_reactions", "message_edit", "comments", "live_comments"];
 function metaSteps(c) {
   const host = c.url.replace(/^https:\/\//, "");
+  const webhook = `   - Callback URL: \`${c.url}/meta\`\n   - Verify token: \`${readEnv().META_VERIFY_TOKEN ?? "(in .env: META_VERIFY_TOKEN)"}\`\n   - Fields: ${WEBHOOK_FIELDS.map((f) => `\`${f}\``).join(", ")}`;
+  const basic = `   - App domains: \`${host}\`\n   - Privacy policy URL: \`${c.url}/privacy\`\n   - Terms of service URL: \`${c.url}/terms\`\n   - User data deletion → Data deletion callback URL: \`${c.url}/data-deletion\`\n   - Category: any that fits (for example Business and pages)\n   - App icon: any square picture (assets/icon.png in this folder works)`;
+  const tester = `In the left menu open **App roles → Roles**, click **Add people**, choose **Instagram tester** and add @${c.instagram_handle}. Then, in the Instagram app or on instagram.com: **Settings → Website permissions → Apps and websites → Tester invites → Accept**.`;
+  const live = `At the top of the app's page, switch **App mode** from Development to **Live**. (If Meta asks for a "data use checkup" or business details first, fill those in. You do **not** need App Review for your own account.)`;
+  if (c.login === "unified") {
+    return [
+      `1. Open https://developers.facebook.com/apps and log in with the Facebook account that manages your Instagram. If it asks you to register as a developer, say yes (free).`,
+      `2. Click **Create app**. Name it anything (for example "FewChat"). On **Use cases**, pick **Content management** on the left, then **Manage messaging & content on Instagram**. On **Business**, pick your business portfolio (or make one: it's free). Then **Next** until **Create app**.`,
+      `3. Your Instagram account has to be in that business portfolio: it's how you'll pick it at login, with no Instagram password. If it isn't yet, add it at https://business.facebook.com/settings → **Accounts → Instagram accounts → Add**.`,
+      `4. On the app's dashboard click **Customize the Manage messaging & content on Instagram use case**. You land on **API setup with Unified login** (Meta says "API setup with Instagram login is not available for newer apps": that's expected). Under **1. Configure your app**, click **Create new configuration**, then **Create from template**. Copy the **Configuration ID** it shows: setup asks for it at the end.`,
+      `5. Under **Register a new redirect URL** on the same page, paste \`${c.url}/auth/callback\` and click **Save**.`,
+      `6. In the left menu open **Use cases**, then **Customize**, then **Permissions and features**. Find \`business_management\` and click **Add** (without it the login works but FewChat can't see your account), then do the same for \`pages_show_list\`.`,
+      `7. In the left menu open **Facebook Login for Business → Configurations**, click **Edit** on the configuration, and click **Next** to the end:\n   - Assets: tick **Pages** and untick **Ad accounts**. (When you log in, you'll share the Facebook Page your Instagram is linked to: without it Instagram sends FewChat your comments but **not your DMs**. No linked Page? Just leave the Page empty then.)\n   - Permissions: tick \`business_management\` and \`pages_show_list\`; keep \`instagram_basic\`, \`instagram_manage_messages\` and \`instagram_manage_comments\`; untick the ads ones and \`instagram_content_publish\`. **Save**.`,
+      `8. Back on **API setup with Unified login**, open **3. Configure webhooks**, paste these two and click **Verify and save**, then switch on every field in the list below:\n${webhook}`,
+      `9. In the left menu open **App settings → Basic** and fill in, then **Save changes**:\n${basic}\n   At the top of that page are the **App ID** and the **App secret** (click Show). Setup asks for both at the end. Then click **Publish** in the left menu and **Publish** again. (No App Review: your own account is enough.)`,
+    ];
+  }
   return [
     `1. Open https://developers.facebook.com/apps and log in with the Facebook account that manages your Instagram. If it asks you to register as a developer, say yes (free).`,
     `2. Click **Create app**. Name it anything (for example "FewChat"). When it asks what the app is for, choose **Other**, then the type **Business**.`,
     `3. On the app's page, find **Instagram** in the product list and click **Set up**. Pick **API setup with Instagram login**.`,
     `4. That page shows an **Instagram app ID** and an **Instagram app secret** (click Show). Setup asks you for both at the end: keep the tab open.`,
-    `5. Under **Configure webhooks** paste these two, click **Verify and save**, then switch on every field in the list below it:\n   - Callback URL: \`${c.url}/meta\`\n   - Verify token: \`${readEnv().META_VERIFY_TOKEN ?? "(in .env: META_VERIFY_TOKEN)"}\`\n   - Fields: ${WEBHOOK_FIELDS.map((f) => `\`${f}\``).join(", ")}`,
+    `5. Under **Configure webhooks** paste these two, click **Verify and save**, then switch on every field in the list below it:\n${webhook}`,
     `6. Under **Set up Instagram business login** (open that section first, the button does nothing while it's folded), click **Business login settings** and paste:\n   - OAuth redirect URI: \`${c.url}/auth/callback\`\n   - Deauthorize callback URL: \`${c.url}/deauthorize\`\n   - Data deletion request URL: \`${c.url}/data-deletion\``,
-    `7. In the left menu open **App settings → Basic** and fill in, then **Save changes**:\n   - App domains: \`${host}\`\n   - Privacy policy URL: \`${c.url}/privacy\`\n   - Terms of service URL: \`${c.url}/terms\`\n   - User data deletion → Data deletion callback URL: \`${c.url}/data-deletion\`\n   - Category: any that fits (for example Business and pages)\n   - App icon: any square picture (assets/icon.png in this folder works)`,
-    `8. In the left menu open **App roles → Roles**, click **Add people**, choose **Instagram tester** and add @${c.instagram_handle}. Then, in the Instagram app or on instagram.com: **Settings → Website permissions → Apps and websites → Tester invites → Accept**.`,
-    `9. At the top of the app's page, switch **App mode** from Development to **Live**. (If Meta asks for a "data use checkup" or business details first, fill those in. You do **not** need App Review for your own account.)`,
+    `7. In the left menu open **App settings → Basic** and fill in, then **Save changes**:\n${basic}`,
+    `8. ${tester}`,
+    `9. ${live}`,
   ];
 }
 function writeSheet(c) {
@@ -529,12 +553,12 @@ Paste the values exactly as they are here.
 
 ${metaSteps(c).join("\n\n")}
 
-When that's done, run \`npm run setup\` again: it asks for the Instagram app ID and secret, then finishes on its own.
+When that's done, run \`npm run setup\` again: it asks for ${c.login === "unified" ? "the App ID, the App secret and the Configuration ID" : "the Instagram app ID and secret"}, then finishes on its own.
 
 ## Connect your Instagram account (after the Meta app)
 
 1. On a computer, open ${c.url}/login and click **Log in with Instagram**.
-2. Log in as @${c.instagram_handle} and approve the three permissions. That connects your account.
+2. ${c.login === "unified" ? `Meta opens as your Facebook account: pick your business portfolio, **the Facebook Page your Instagram is linked to** (Business settings → Instagram accounts → your account → Connected assets shows which), and @${c.instagram_handle} only. Then **Next**, **Confirm**, **Finish**.` : `Log in as @${c.instagram_handle} and approve the three permissions.`} That connects your account.
 3. Run \`npm run check\`: it tells you whether everything is working.
 
 If the button gives an error, log in with the password instead and click **Connect Instagram** at the top left.
@@ -551,8 +575,10 @@ If the button gives an error, log in with the password instead and click **Conne
 // ----------------------------------------------------------------------------------------------------------- setup
 
 async function basics(c) {
-  const given = { instagram_handle: flag("handle"), business_name: flag("business"), contact_email: flag("email"), website: flag("website"), link: flag("link"), worker_name: flag("name"), instagram_app_id: flag("app-id") };
+  const given = { instagram_handle: flag("handle"), business_name: flag("business"), contact_email: flag("email"), website: flag("website"), link: flag("link"), worker_name: flag("name"), instagram_app_id: flag("app-id"), login: flag("login"), login_config_id: flag("config-id") };
   for (const [k, v] of Object.entries(given)) if (v && v !== "true") c[k] = v;
+  if (c.login && !/^(unified|instagram)$/.test(c.login)) throw fail(`--login is unified or instagram, not "${c.login}".`);
+  c.login ||= c.instagram_app_id ? "instagram" : "unified"; // an install from before Unified login keeps its Instagram login
   const need = ["instagram_handle", "business_name", "contact_email"].filter((k) => !c[k]);
   if (need.length && !TTY) {
     throw waitFor([
@@ -584,24 +610,28 @@ async function basics(c) {
 
 async function metaApp(c) {
   const env = readEnv();
-  if (c.instagram_app_id && env.META_APP_SECRET) return true;
+  const unified = c.login === "unified";
+  if (c.instagram_app_id && env.META_APP_SECRET && (!unified || c.login_config_id)) return true;
   say("  Instagram only lets an app send DMs for you if you register that app with Meta. It's free and takes about 15 minutes.");
   say(`  Every click, with your own addresses already filled in, is in ${bold("MY-SETUP.md")} in this folder. Open it and follow the 9 steps.`);
   say();
   if (!TTY) {
     throw waitFor([
       "Waiting on the Meta app. When the 9 steps in MY-SETUP.md are done:",
-      "  1. Put the Instagram app secret in .env on the line META_APP_SECRET=  (never in chat)",
-      "  2. Run: npm run setup -- --app-id=<the Instagram app ID>",
+      ...(unified
+        ? ["  1. Put the App secret (App settings → Basic) in .env on the line META_APP_SECRET=  (never in chat)", "  2. Run: npm run setup -- --app-id=<the App ID> --config-id=<the Configuration ID>"]
+        : ["  1. Put the Instagram app secret in .env on the line META_APP_SECRET=  (never in chat)", "  2. Run: npm run setup -- --app-id=<the Instagram app ID>"]),
     ]);
   }
   openInBrowser("https://developers.facebook.com/apps");
   const ready = await ask("Type " + bold("done") + " when you've finished the 9 steps, or " + bold("later") + " to stop here and come back.", { check: (v) => (/^(done|later)$/i.test(v) ? null : "Type done or later.") });
   if (/later/i.test(ready)) throw waitFor(["No problem. When the Meta app is done, run `npm run setup` again: it continues from here."]);
-  if (!c.instagram_app_id) c.instagram_app_id = await ask("Paste the " + bold("Instagram app ID") + " (a long number).", { check: (v) => (/^\d{8,20}$/.test(v) ? null : "The Instagram app ID is only digits. It's on Instagram → API setup with Instagram login.") });
+  const id = unified ? "App ID" : "Instagram app ID", secretName = unified ? "App secret" : "Instagram app secret";
+  if (!c.instagram_app_id) c.instagram_app_id = await ask("Paste the " + bold(id) + " (a long number).", { check: (v) => (/^\d{8,20}$/.test(v) ? null : `The ${id} is only digits. It's on ${unified ? "App settings → Basic" : "Instagram → API setup with Instagram login"}.`) });
+  if (unified && !c.login_config_id) c.login_config_id = await ask("Paste the " + bold("Configuration ID") + " from step 4 (a long number).", { check: (v) => (/^\d{6,24}$/.test(v) ? null : "The Configuration ID is only digits. It's under API setup with Unified login → 1. Configure your app.") });
   if (!env.META_APP_SECRET) {
-    const secret = await askHidden("Paste the " + bold("Instagram app secret") + " (it stays hidden as you paste), then press Enter.");
-    if (!/^[0-9a-f]{20,64}$/i.test(secret)) throw fail(["That doesn't look like an Instagram app secret (letters a-f and numbers, about 32 long).", "Run `npm run setup` again and paste the one behind **Show** next to the Instagram app ID."]);
+    const secret = await askHidden("Paste the " + bold(secretName) + " (it stays hidden as you paste), then press Enter.");
+    if (!/^[0-9a-f]{20,64}$/i.test(secret)) throw fail([`That doesn't look like an ${secretName} (letters a-f and numbers, about 32 long).`, `Run \`npm run setup\` again and paste the one behind **Show** next to the ${id}.`]);
     setEnv("META_APP_SECRET", secret);
   }
   saveConfig(c);
@@ -613,14 +643,14 @@ async function connectInstagram(c) {
   let s = settings(c);
   if (!s?.ig_token) {
     say(`  Last step. On this computer, open ${bold(`${c.url}/login`)}`);
-    say(`  Click ${bold("Log in with Instagram")}, log in as @${c.instagram_handle} and approve the three permissions.`);
+    say(`  Click ${bold("Log in with Instagram")}, ${c.login === "unified" ? `pick the Facebook Page your Instagram is linked to and @${c.instagram_handle} when Meta asks, then Next, Confirm, Finish.` : `log in as @${c.instagram_handle} and approve the three permissions.`}`);
     if (!TTY) throw waitFor(["Waiting on you to connect Instagram (see above). Then run `npm run check`."]);
     openInBrowser(`${c.url}/login`);
     await enter("When Instagram is connected, come back here.");
     s = settings(c);
     if (!s?.ig_token) throw waitFor(["Instagram isn't connected yet.", `Open ${c.url}/login, click Log in with Instagram, then run \`npm run check\`. If Instagram shows an error there, step 6 or 8 in MY-SETUP.md is the usual cause.`]);
   }
-  const me = await instagram(s.ig_token, "/me?fields=username");
+  const me = await instagram(c, s, "/me?fields=username");
   ok(`Instagram is connected${me?.username ? ` as @${me.username}` : ""}`);
   if (s.webhook_at) return ok(`Instagram is sending FewChat your messages (last one ${ago(Number(s.webhook_at))})`);
   if (!TTY) return warn("No message has arrived from Instagram yet. Send your account a DM from another account, then run `npm run check`.");
@@ -781,11 +811,11 @@ async function check() {
     no("Instagram isn't connected", `Open ${c.url}/login on a computer and click Log in with Instagram.`);
     return done(problems);
   }
-  const me = await instagram(s.ig_token, "/me?fields=username");
+  const me = await instagram(c, s, "/me?fields=username");
   if (me?.username) ok(`Instagram connected as @${me.username}`);
   else no("Instagram refused the saved login", `It expired or was revoked. Open ${c.url}/auth/start and approve again.`);
 
-  const subs = await instagram(s.ig_token, "/me/subscribed_apps");
+  const subs = await instagram(c, s, "/me/subscribed_apps");
   const fields = subs?.data?.[0]?.subscribed_fields ?? [];
   if (fields.includes("messages") && fields.includes("comments")) ok("Subscribed to your DMs and comments");
   else if (subs) no("Instagram isn't set to send your DMs and comments here", `Open ${c.url}/auth/start and approve again: that switches them on.`);

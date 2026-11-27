@@ -51,10 +51,25 @@ If it pauses earlier:
 
 Tell the user to open `MY-SETUP.md` in this folder: it has the 9 steps with their own addresses already filled in, to copy and paste. Walk them through one step at a time and wait for "done" after each. Their address is the `url` in `fewchat.config.json`, if you need to refer to it.
 
-The steps, so you can answer questions (in every address, `<url>` is theirs):
+**Two kinds of Meta app.** Every app created since late October 2026 only offers **API setup with Unified login**: that's the default, and the steps below. An older app that still shows **API setup with Instagram login** uses the older steps: run `npm run setup -- --login=instagram` and `MY-SETUP.md` is rewritten with those (their numbers differ from these). `login` in `fewchat.config.json` says which one an install uses.
+
+The steps (Unified login), so you can answer questions (in every address, `<url>` is theirs):
 
 1. developers.facebook.com/apps, logged in with the Facebook account that manages the Instagram account. Register as a developer if asked.
-2. **Create app** → any name → use case **Other** → type **Business**.
+2. **Create app** → any name → use case **Content management → Manage messaging & content on Instagram** → their business portfolio (or a new one) → **Create app**.
+3. The Instagram account must be in that business portfolio (business.facebook.com/settings → Accounts → Instagram accounts). That's how it's picked at login: no Instagram password, no tester role.
+4. Dashboard → **Customize the Manage messaging & content on Instagram use case** → **API setup with Unified login** ("API setup with Instagram login is not available for newer apps" is expected) → **Create new configuration** → **Create from template**. Note the **Configuration ID** (its token never expires).
+5. **Register a new redirect URL** on the same page: `<url>/auth/callback`, Save.
+6. **Use cases → Customize → Permissions and features**: **Add** `business_management` and `pages_show_list`. The configuration only offers permissions the use case has.
+7. **Facebook Login for Business → Configurations → Edit**: assets **Pages** on, **Ad accounts** off; permissions `business_management`, `pages_show_list`, `instagram_basic`, `instagram_manage_messages`, `instagram_manage_comments` (ads and content_publish off). Save.
+8. **3. Configure webhooks** on the Unified login page: callback URL `<url>/meta`, verify token from `MY-SETUP.md`. Verify and save, then switch on `comments`, `live_comments`, `message_edit`, `message_reactions`, `messages`, `messaging_postbacks`, `messaging_referral`, `messaging_seen`.
+9. **App settings → Basic**: app domain (the address without `https://`), privacy `<url>/privacy`, terms `<url>/terms`, data deletion `<url>/data-deletion`, a category; note the **App ID** and **App secret**. Then **Publish** in the left menu → **Publish**. No icon, App Review or tester role needed.
+
+**The Page is what makes DMs arrive.** At login Meta asks for a business portfolio, a Page (marked optional) and the Instagram account. If the Instagram account is linked to a Facebook Page (Business settings → Instagram accounts → the account → Connected assets) and that Page isn't shared, comments still arrive by webhook but DMs never do (Meta documents this as a temporary limitation; confirmed live 2026-11-27). FewChat's missed-DM sync still records them within a minute, so nothing is lost, but automations and the AI answer late. Fix: log in again (`<url>/auth/start`) and share the Page.
+
+The older steps (Instagram login):
+
+1. and 2. as above, but the use case is **Other** → type **Business**.
 3. Add the **Instagram** product → **API setup with Instagram login**.
 4. Note the **Instagram app ID** and **Instagram app secret** on that page.
 5. **Configure webhooks**: callback URL `<url>/meta`, verify token from `MY-SETUP.md`. Verify and save, then switch on the fields `messages`, `messaging_postbacks`, `messaging_seen`, `messaging_referral`, `message_reactions`, `message_edit`, `comments`, `live_comments`.
@@ -67,11 +82,11 @@ Meta moves things around. If a label isn't where a step says, look for the neare
 
 Then:
 
-- Have the user paste the **Instagram app secret** into `.env`, after `META_APP_SECRET=`, and say done.
-- Ask for the **Instagram app ID** (a number, not secret) and run:
+- Have the user paste the **App secret** (older apps: the **Instagram app secret**) into `.env`, after `META_APP_SECRET=`, and say done.
+- Ask for the **App ID** and the **Configuration ID** (numbers, not secret; older apps: the **Instagram app ID** only) and run:
 
 ```bash
-npm run setup -- --app-id=<Instagram app ID>
+npm run setup -- --app-id=<App ID> --config-id=<Configuration ID>
 ```
 
 It stores the secret, puts the final version live and pauses at "Connect your Instagram account".
@@ -81,9 +96,9 @@ It stores the secret, puts the final version live and pauses at "Connect your In
 Tell the user to, on a computer (the button isn't shown on phones):
 
 1. Open `<url>/login` and click **Log in with Instagram**.
-2. Log in as the account they gave in step 1 and approve the three permissions. The first sign-in connects the account; any other Instagram account is turned away.
+2. Log in as the account they gave in step 1 and approve. On a Unified login app, Meta asks which assets to share: their business portfolio, the Facebook Page the Instagram account is linked to, and that Instagram account only. The first sign-in connects the account; any other Instagram account is turned away.
 
-If Instagram shows an error instead, it names the cause (the redirect URI from Meta step 6, or the tester invite from step 8). They can always get in with the password from `MY-SETUP.md` on the same page, then click **Connect Instagram** at the top left.
+If Meta shows an error instead, it names the cause (the redirect URL from step 5, or on an older Instagram-login app the tester invite). FewChat's own errors say what to fix ("Meta didn't share an Instagram account" = `business_management` is missing from the configuration). They can always get in with the password from `MY-SETUP.md` on the same page, then click **Connect Instagram** at the top left.
 
 Then run:
 
@@ -97,7 +112,7 @@ Every line should have a ✓ except "Nothing has ever arrived from Instagram", w
 
 From a **second** Instagram account (a friend's or a spare; a message to yourself doesn't count):
 
-1. **A DM.** Send the account a DM. It should be in the console's Inbox within seconds, and `npm run check` now shows Instagram's last delivery. Nothing arriving means step 9 (not Live) or step 5 (webhook) in almost every case.
+1. **A DM.** Send the account a DM. It should be in the console's Inbox within seconds, and `npm run check` now shows Instagram's last delivery. Nothing arriving means step 9 (not published) or step 8 (webhook) in almost every case. Arriving only after a minute or so (the sync, not the webhook) on a Unified login app means the linked Facebook Page wasn't shared at login: log in again at `<url>/auth/start` and pick it.
 2. **A comment automation.** In the console: Automation → New Automation → the template **Comment keyword → DM link** → pick a post, a test keyword and their link → **Publish**. Comment the keyword from the second account: the DM arrives within seconds.
 
 Done = both worked. Show them where things are: the console address, `MY-SETUP.md`, `npm run check`, `npm run update`.

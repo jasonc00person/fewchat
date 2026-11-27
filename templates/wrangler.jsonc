@@ -31,10 +31,14 @@
     "TRANSPORT": "meta",
     // Autopilot sends look typed: seen, typing dots, a pause sized to each bubble (src/setter.ts deliver).
     "TYPING": "true",
-    // Meta dashboard → your app → Instagram → API setup with Instagram login → "Instagram app ID" (setup asks for it).
-    "META_IG_APP_ID": "REPLACE_INSTAGRAM_APP_ID"
+    // Your Meta app's id (setup asks for it): App settings → Basic → "App ID" on a Unified login app (every app made
+    // since late October 2026); an older app's "Instagram app ID" from API setup with Instagram login.
+    "META_IG_APP_ID": "REPLACE_INSTAGRAM_APP_ID",
+    // Unified login only: the login configuration's id (API setup with Unified login → Configure your app). Empty = the
+    // older Instagram login. Setup fills it in.
+    "META_LOGIN_CONFIG_ID": ""
   }
   // Passwords and keys never go in this file. They live in .env, and `npm run setup` stores them encrypted in the
-  // Worker: INBOUND_SECRET, ADMIN_PASSWORD, META_VERIFY_TOKEN, META_APP_SECRET (Instagram app secret); optional
+  // Worker: INBOUND_SECRET, ADMIN_PASSWORD, META_VERIFY_TOKEN, META_APP_SECRET (the App secret; an older app's Instagram app secret); optional
   // ANTHROPIC_API_KEY (the AI, reading photos), ALERT_TOPIC, SKOOL_AUTH_TOKEN, REVIEW_PASSWORD, MANYCHAT_API_KEY.
 }
