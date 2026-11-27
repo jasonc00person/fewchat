@@ -2,11 +2,14 @@
 // stored as images) and looked up again every few days, newest threads first, a batch per cron tick.
 
 import * as db from "./db";
-import { fetchProfile } from "./meta";
+import { fetchProfile, unifiedToken } from "./meta";
 import type { Env } from "./setter";
 
 const STALE_MS = 3 * 24 * 60 * 60 * 1000;
+// Unified login's calls come out of the Meta app's own budget (RATE_LIMITED in src/meta.ts), where 40 lookups a minute
+// was the biggest single spend: a quarter of that still catches up a few hundred threads an hour.
 const PER_TICK = 40;
+const PER_TICK_UNIFIED = 10;
 
 export async function saveProfile(d1: D1Database, leadId: string, p: { username: string | null; name: string | null; pic: string | null }, now: number): Promise<void> {
   await d1
@@ -24,7 +27,7 @@ export async function refreshProfiles(env: Env, now: number): Promise<void> {
   const { results } = await env.DB.prepare(
     `SELECT subscriber_id FROM leads WHERE (profile_at IS NULL OR profile_at < ?1) AND members IS NULL ORDER BY COALESCE(last_at, created_at) DESC LIMIT ?2`,
   )
-    .bind(now - STALE_MS, PER_TICK)
+    .bind(now - STALE_MS, unifiedToken(token) ? PER_TICK_UNIFIED : PER_TICK)
     .all<{ subscriber_id: string }>();
   for (const { subscriber_id } of results) await saveProfile(env.DB, subscriber_id, await fetchProfile(token, subscriber_id), now);
 }

@@ -4,6 +4,7 @@
 
 import { ORIGIN } from "./brand";
 import * as db from "./db";
+import { metaHeld, metaHeldUntil } from "./meta";
 import type { Env } from "./setter";
 
 const MIN = 60_000;
@@ -112,6 +113,10 @@ export async function cronStep(env: Env, name: string, now: number, run: () => P
 
 // Cron: sends failing, comment DMs backing up, the webhook gone quiet.
 export async function checkHealth(env: Env, now: number): Promise<void> {
+  if (metaHeld(now)) {
+    const until = new Date(metaHeldUntil()).toISOString().slice(11, 16);
+    await alert(env, "meta-limit", "Meta's rate limit", `Instagram answered "request limit reached". FewChat holds its calls until ${until} UTC; comment DMs and automation messages wait and go out after.`, now);
+  }
   const since = now - 15 * MIN;
   const failed = await env.DB.prepare(
     `SELECT (SELECT COUNT(*) FROM comments WHERE status = 'failed' AND created_at > ?1)
@@ -154,10 +159,11 @@ export async function checkHealth(env: Env, now: number): Promise<void> {
 
   // Automations stuck mid-flow: a smart delay that never ran, a message that never settled.
   const flows = await env.DB.prepare(
-    `SELECT (SELECT COUNT(*) FROM flow_runs WHERE status = 'scheduled' AND run_at < ?1) overdue,
+    // Messages waiting out Meta's rate limit (src/flows.ts parkLimited) aren't stuck while it holds.
+    `SELECT (SELECT COUNT(*) FROM flow_runs WHERE status = 'scheduled' AND run_at < ?1 AND (?2 = 0 OR node_id NOT LIKE 'rl:%')) overdue,
             (SELECT COUNT(*) FROM flow_sends WHERE status = 'sending' AND created_at < ?1) sending`,
   )
-    .bind(now - 10 * MIN)
+    .bind(now - 10 * MIN, metaHeld(now) ? 1 : 0)
     .first<{ overdue: number; sending: number }>();
   if ((flows?.overdue ?? 0) + (flows?.sending ?? 0) > 0) {
     await alert(env, "flows", "Automations stuck", `${flows!.overdue} smart delays overdue, ${flows!.sending} flow messages stuck sending for 10+ min.`, now);

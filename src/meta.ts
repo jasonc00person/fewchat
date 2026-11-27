@@ -23,6 +23,130 @@ export function useAccount(id: string | null): void {
   account = id;
 }
 
+// The other login's token (ig_token_previous, set with the account): for up to a day after a switch, threads the old
+// app took are still its own and refuse the new app's messages ("not the thread owner", subcode 2534037), while the
+// old app can still answer in them. graph() sends a refused message once more on it. Null on an install that never moved.
+let other: string | null = null;
+export function useOtherToken(token: string | null): void {
+  other = token;
+}
+const NOT_OWNER = /not the thread owner/i;
+
+// Meta's rate limits. Code 4 is the app's own ("Application request limit reached"), 17 a user's, 32 a Page's,
+// 80002 / 80006 the Instagram / Messenger account budget. Once one answers, every call fails until it lifts, and each
+// failed try still counts. So the first one holds every call on that login for a while (Meta's own estimate when it
+// gives one, else 5 minutes doubling to an hour), shared through D1 setting `meta_hold` so every isolate waits, and
+// callers treat the held call like the real error: comments queue, flow messages park until it lifts (src/flows.ts),
+// the cron's background calls stand down. Seen 2026-11-27: the Unified app answered code 4 to everything for 17
+// minutes under a viral reel. 613 (the 750 private replies an hour) is one endpoint's cap, not this: the comment queue
+// paces it. Each login is its own Meta app with its own budget, so each has its own hold ("ig" / "fb", by token).
+export const RATE_LIMITED = /instagram \d+ code (4|17|32|80002|80006):/;
+const HOLD_MS = 5 * 60_000;
+const MAX_HOLD_MS = 60 * 60_000;
+// Meta's usage headers say how much of the budget the last hour used (percent). Past BUSY the cron's optional calls
+// (profile pictures, the missed-message sync, comment backfill, broadcasts) wait, so what's left goes to replies.
+export const BUSY_PCT = 75;
+type Kind = "ig" | "fb";
+type Hold = { until: number; strikes: number };
+const kindOf = (token: string | null | undefined): Kind => (unifiedToken(token) ? "fb" : "ig");
+let store: D1Database | null = null;
+let inUse: Kind = "ig";
+const holds: Record<Kind, Hold> = { ig: { until: 0, strikes: 0 }, fb: { until: 0, strikes: 0 } };
+const setAt: Record<Kind, number> = { ig: 0, fb: 0 };
+let usage = { pct: 0, at: 0 };
+let usageSaved = 0;
+// Every entry point (src/index.ts login) with what D1 has. A hold this isolate set in the last few seconds that D1
+// doesn't show yet (its write still on the way, or lost to a database blip) stands; past that D1 is the truth, so
+// editing or deleting meta_hold frees every isolate.
+const OWN_HOLD_MS = 10_000;
+export function useMetaState(d1: D1Database | null, hold: string | null | undefined, saved: string | null | undefined, token?: string | null): void {
+  store = d1;
+  inUse = kindOf(token);
+  const h = parse<Partial<Record<Kind, Partial<Hold>>>>(hold) ?? {};
+  const now = Date.now();
+  for (const k of ["ig", "fb"] as const) {
+    const d = { until: Number(h[k]?.until) || 0, strikes: Number(h[k]?.strikes) || 0 };
+    holds[k] = d1 && now - setAt[k] < OWN_HOLD_MS && holds[k].until > d.until ? holds[k] : d;
+  }
+  const u = parse<{ pct?: number; at?: number }>(saved);
+  usage = { pct: u?.pct ?? 0, at: u?.at ?? 0 };
+  usageSaved = usage.at; // so a busy reading is written about once a minute across isolates, not once per request
+}
+const parse = <T>(s: string | null | undefined): T | null => {
+  try {
+    return s ? (JSON.parse(s) as T) : null;
+  } catch {
+    return null;
+  }
+};
+// The login in use is held.
+export const metaHeld = (now = Date.now()) => holds[inUse].until > now;
+// When every hold is over: where a stopped message waits till (a thread the other login's app owns needs that one).
+export const metaHeldUntil = () => Math.max(holds.ig.until, holds.fb.until);
+// Held, or the budget was past BUSY_PCT within the last 5 minutes.
+export const metaBusy = (now = Date.now()) => metaHeld(now) || (usage.pct >= BUSY_PCT && now - usage.at < 5 * 60_000);
+export const metaUsage = () => ({ ...usage });
+
+const saveSetting = (key: string, value: string) =>
+  store?.prepare(`INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = excluded.value`).bind(key, value).run().catch(() => {});
+
+// meta_hold is {"ig":{until,strikes},"fb":{...}}: each write touches its own login's part, and never shortens a hold
+// another isolate wrote, nor clears one that hasn't run out.
+const HOLD_JSON = `CASE WHEN json_valid(settings.value) AND json_type(settings.value) = 'object' THEN settings.value ELSE '{}' END`;
+const saveHold = (k: Kind, h: Hold) =>
+  store
+    ?.prepare(
+      `INSERT INTO settings (key, value) VALUES ('meta_hold', json_object(?1, json(?2)))
+       ON CONFLICT (key) DO UPDATE SET value = json_set(${HOLD_JSON}, '$.' || ?1, json(?2))
+       WHERE COALESCE(json_extract(${HOLD_JSON}, '$.' || ?1 || '.until'), 0) < ?3`,
+    )
+    .bind(k, JSON.stringify(h), h.until)
+    .run()
+    .catch(() => {});
+const clearHold = (k: Kind, now: number) =>
+  store
+    ?.prepare(`UPDATE settings SET value = json_set(${HOLD_JSON}, '$.' || ?1, json('{"until":0,"strikes":0}')) WHERE key = 'meta_hold' AND COALESCE(json_extract(${HOLD_JSON}, '$.' || ?1 || '.until'), 0) <= ?2`)
+    .bind(k, now)
+    .run()
+    .catch(() => {});
+
+// X-App-Usage: {"call_count":n,"total_time":n,"total_cputime":n}; X-Business-Use-Case-Usage: {"<id>":[{"type":...,
+// "call_count":n,...,"estimated_time_to_regain_access":minutes}]}. Both percent. The highest number is what's left.
+export function readUsage(h: Headers): { pct: number; eta: number; seen: boolean } {
+  let pct = 0;
+  let eta = 0;
+  let seen = false;
+  const take = (u: { call_count?: number; total_time?: number; total_cputime?: number; estimated_time_to_regain_access?: number } | null | undefined) => {
+    if (!u || typeof u !== "object") return;
+    seen = true;
+    pct = Math.max(pct, Number(u.call_count) || 0, Number(u.total_time) || 0, Number(u.total_cputime) || 0);
+    eta = Math.max(eta, Number(u.estimated_time_to_regain_access) || 0);
+  };
+  take(parse(h.get("x-app-usage")));
+  for (const list of Object.values(parse<Record<string, unknown>>(h.get("x-business-use-case-usage")) ?? {})) for (const u of Array.isArray(list) ? list : []) take(u);
+  return { pct, eta, seen };
+}
+
+async function noteUsage(h: Headers, now: number): Promise<number> {
+  const { pct, eta, seen } = readUsage(h);
+  if (seen) usage = { pct, at: now };
+  if (pct >= BUSY_PCT && now - usageSaved > 60_000) {
+    usageSaved = now;
+    await saveSetting("meta_usage", JSON.stringify(usage));
+  }
+  return eta;
+}
+
+// A burst of calls that were already on their way when the limit hit is one strike, not one each.
+async function hold(k: Kind, now: number, etaMin: number): Promise<void> {
+  const h = holds[k];
+  const strikes = h.until > now ? h.strikes : h.strikes + 1;
+  const until = Math.max(h.until, now + Math.max(etaMin * 60_000, Math.min(HOLD_MS * 2 ** (strikes - 1), MAX_HOLD_MS)));
+  holds[k] = { until, strikes };
+  setAt[k] = now;
+  await saveHold(k, holds[k]);
+}
+
 // A message id's "<account>:<thread>:<item>". The two logins give the same message different ids (Instagram Login's
 // decode to "ig_d...", Unified login's to "new_ig_dm_..."), but both carry these three numbers in their base64, at an
 // offset. So this is what finds a message by an id from either (messages.mkey). Null for anything else ("pb:" taps,
@@ -48,6 +172,14 @@ export function midKey(mid: string | null | undefined): string | null {
 // it back (reading an Instagram Login id with a Unified token answers code 1), so a reaction or a reply quote that names
 // it can't be sent. Instagram Login ids are base64 of "ig_d...", Unified login's of "new_ig_dm_...".
 export const otherLoginMid = (mid: string, token: string | null | undefined) => mid.startsWith(unifiedToken(token) ? "aWdfZA" : "bmV3X2lnX2RtX");
+
+// Conversation Routing: an app that doesn't own a thread gets its events under entry.standby, same shape, instead of
+// entry.messaging. Under Unified login that's every thread another app took in the last 24h (Manychat's flows, and for a
+// day after a switch the old login's app); Instagram Login delivers everything on messaging. Each app gets an event on
+// one of the two, so reading both counts nothing twice. Seen live 2026-11-27: taps and DMs in threads the old app owned
+// never reached the new app until it subscribed to standby.
+export type Routed<T> = { messaging?: T[]; standby?: T[] };
+export const messagingOf = <T>(entry: Routed<T>): T[] => [...(entry.messaging ?? []), ...(entry.standby ?? [])];
 
 export async function hmacHex(secret: string, body: string): Promise<string> {
   const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
@@ -196,10 +328,10 @@ export function webhookParts(m: { reply_to?: { story?: { url?: string; id?: stri
 // mid -> parts for every message in a webhook payload that has any.
 export function parseParts(payload: unknown): Map<string, Part[]> {
   const out = new Map<string, Part[]>();
-  const p = payload as { object?: string; entry?: { messaging?: { message?: RawMessaging["message"] & { reply_to?: { story?: { url?: string; id?: string } } } }[] }[] };
+  const p = payload as { object?: string; entry?: Routed<{ message?: RawMessaging["message"] & { reply_to?: { story?: { url?: string; id?: string } } } }>[] };
   if (p?.object !== "instagram" || !Array.isArray(p.entry)) return out;
   for (const entry of p.entry) {
-    for (const ev of entry.messaging ?? []) {
+    for (const ev of messagingOf(entry)) {
       const m = ev.message;
       if (!m?.mid || m.is_deleted) continue;
       const parts = webhookParts(m);
@@ -213,10 +345,10 @@ export function parseParts(payload: unknown): Map<string, Part[]> {
 // a message back through the API has no reply field, so it's saved now or never.
 export function parseReplies(payload: unknown): Map<string, string> {
   const out = new Map<string, string>();
-  const p = payload as { object?: string; entry?: { messaging?: RawMessaging[] }[] };
+  const p = payload as { object?: string; entry?: Routed<RawMessaging>[] };
   if (p?.object !== "instagram" || !Array.isArray(p.entry)) return out;
   for (const entry of p.entry) {
-    for (const ev of entry.messaging ?? []) {
+    for (const ev of messagingOf(entry)) {
       const m = ev.message;
       const to = m?.reply_to?.mid;
       if (m?.mid && !m.is_deleted && typeof to === "string" && to && to !== m.mid) out.set(m.mid, to);
@@ -229,20 +361,17 @@ export function parseReplies(payload: unknown): Map<string, string> {
 export function parseMessageUpdates(payload: unknown): MessageUpdate[] {
   const p = payload as {
     object?: string;
-    entry?: {
-      id?: string;
-      messaging?: {
-        sender?: { id?: string };
-        message?: { mid?: string; is_deleted?: boolean };
-        reaction?: { mid?: string; action?: string; emoji?: string };
-        message_edit?: { mid?: string; text?: string };
-      }[];
-    }[];
+    entry?: (Routed<{
+      sender?: { id?: string };
+      message?: { mid?: string; is_deleted?: boolean };
+      reaction?: { mid?: string; action?: string; emoji?: string };
+      message_edit?: { mid?: string; text?: string };
+    }> & { id?: string })[];
   };
   if (p?.object !== "instagram" || !Array.isArray(p.entry)) return [];
   const out: MessageUpdate[] = [];
   for (const entry of p.entry) {
-    for (const ev of entry.messaging ?? []) {
+    for (const ev of messagingOf(entry)) {
       if (ev.reaction?.mid) {
         const who = ev.sender?.id && ev.sender.id === entry.id ? "you" : "lead";
         out.push({ kind: "reaction", mid: ev.reaction.mid, who, emoji: ev.reaction.action === "unreact" ? null : asEmoji(ev.reaction.emoji ?? "\u2764") });
@@ -255,11 +384,11 @@ export function parseMessageUpdates(payload: unknown): MessageUpdate[] {
 }
 
 export function parseWebhook(payload: unknown): MetaEvent[] {
-  const p = payload as { object?: string; entry?: { id?: string; messaging?: RawMessaging[] }[] };
+  const p = payload as { object?: string; entry?: (Routed<RawMessaging> & { id?: string })[] };
   if (p?.object !== "instagram" || !Array.isArray(p.entry)) return [];
   const events: MetaEvent[] = [];
   for (const entry of p.entry) {
-    for (const ev of entry.messaging ?? []) {
+    for (const ev of messagingOf(entry)) {
       const m = ev.message;
       if (!m?.mid || m.is_deleted || m.is_unsupported) continue;
       const text = describe(m);
@@ -312,16 +441,58 @@ export function parseComments(payload: unknown): MetaComment[] {
   return out;
 }
 
-export async function graph<T>(path: string, init?: RequestInit): Promise<T> {
+export const graph = <T>(path: string, init?: RequestInit): Promise<T> => call<T>(path, init, false);
+// Logging in and connecting: never waits on the hold (signing in, or going back to the other login, mid-limit).
+export const graphUnheld = <T>(path: string, init?: RequestInit): Promise<T> => call<T>(path, init, true);
+
+async function call<T>(path: string, init: RequestInit | undefined, unheld: boolean): Promise<T> {
   // The host follows the call's own token (the Authorization header, or access_token in the query); paging links come
   // back as full URLs on either host; "/me" is the account under Unified login.
   const token = new Headers(init?.headers).get("Authorization")?.replace(/^Bearer /, "") ?? new URL(path, "https://x").searchParams.get("access_token");
   const unified = unifiedToken(token);
+  const k = kindOf(token);
   const rel = path.replace(/^https:\/\/graph\.(instagram|facebook)\.com\/v[\d.]+/, "").replace(/^\/me(?=[/?]|$)/, unified && account ? `/${account}` : "/me");
+  const now = Date.now();
+  if (!unheld && holds[k].until > now) throw new Error(`instagram 429 code 4: held by FewChat until ${new Date(holds[k].until).toISOString()} (Meta's rate limit)`);
   const res = await fetch(`${unified ? FB_GRAPH : IG_GRAPH}${rel}`, init);
-  const body = (await res.json().catch(() => ({}))) as T & { error?: { message?: string; code?: number } };
-  if (!res.ok || body.error) throw new Error(`instagram ${res.status}${body.error?.code ? ` code ${body.error.code}` : ""}: ${body.error?.message ?? "request failed"}`);
+  const eta = k === inUse ? await noteUsage(res.headers, now) : readUsage(res.headers).eta;
+  const body = (await res.json().catch(() => ({}))) as T & { error?: { message?: string; code?: number; error_subcode?: number } };
+  if (res.ok && !body.error && holds[k].strikes && holds[k].until <= now) {
+    holds[k] = { until: 0, strikes: 0 }; // it lifted: the next limit starts over at 5 minutes
+    await clearHold(k, now);
+  }
+  if (!res.ok || body.error) {
+    const err = new Error(`instagram ${res.status}${body.error?.code ? ` code ${body.error.code}` : ""}: ${body.error?.message ?? "request failed"}`);
+    // 2534040 = the private-replies cap, which Meta sometimes words as code 4: only comment DMs wait for that one.
+    if (RATE_LIMITED.test(err.message) && body.error?.error_subcode !== 2534040) await hold(k, now, eta);
+    if (other && token && other !== token && NOT_OWNER.test(err.message) && /^\/me\/messages(\?|$)/.test(path)) {
+      // The other login's app owns this thread: the same message from it. A clean refusal there (it doesn't own the
+      // thread either: Manychat does; or its token is gone) throws the first error, which callers act on (src/setter.ts
+      // sends those through Manychat). Anything else (a timeout, a rate limit) may mean it went out: that error stands.
+      try {
+        const headers = new Headers(init?.headers);
+        headers.set("Authorization", `Bearer ${other}`);
+        return await call<T>(path, { ...init, headers, body: forOther(init?.body, other) }, unheld);
+      } catch (e) {
+        throw NOT_OWNER.test(String(e)) || / code 190:/.test(String(e)) ? err : e;
+      }
+    }
+    throw err;
+  }
   return body;
+}
+
+// A reply quote can only name a message by the sending login's own id.
+function forOther(body: RequestInit["body"], token: string): RequestInit["body"] {
+  if (typeof body !== "string") return body;
+  try {
+    const j = JSON.parse(body) as { reply_to?: { mid?: string } };
+    if (!j.reply_to?.mid || !otherLoginMid(j.reply_to.mid, token)) return body;
+    delete j.reply_to;
+    return JSON.stringify(j);
+  } catch {
+    return body;
+  }
 }
 
 // `replyTo` quotes one of the thread's messages above the text, like swiping to reply in the app.
@@ -462,13 +633,17 @@ export async function refreshToken(token: string): Promise<string> {
   return body.access_token;
 }
 
+// Unified login adds standby: the events of threads another app owns (messagingOf).
 export async function subscribe(token: string): Promise<void> {
-  await graph(`/me/subscribed_apps?${new URLSearchParams({ subscribed_fields: "messages,messaging_postbacks,messaging_seen,comments,live_comments", access_token: token })}`, { method: "POST" });
+  const fields = `messages,messaging_postbacks,messaging_seen,comments,live_comments${unifiedToken(token) ? ",standby" : ""}`;
+  await graphUnheld(`/me/subscribed_apps?${new URLSearchParams({ subscribed_fields: fields, access_token: token })}`, { method: "POST" });
 }
 
-// The other login's subscription, once the account has moved: its app stops delivering (until then src/index.ts ignores it).
-export async function unsubscribe(token: string): Promise<void> {
-  await graph(`/me/subscribed_apps?${new URLSearchParams({ access_token: token })}`, { method: "DELETE" });
+// The other login's app, once the account has moved: its taps. A tap goes to the app that owns the thread, which for a
+// day is often the old one; src/index.ts takes the old app's taps and nothing else from it, so whatever else it stays
+// subscribed to is acknowledged and dropped.
+export async function subscribeTaps(token: string): Promise<void> {
+  await graphUnheld(`/me/subscribed_apps?${new URLSearchParams({ subscribed_fields: "messaging_postbacks", access_token: token })}`, { method: "POST" });
 }
 
 // Unified login: was the Facebook Page the account is linked to shared at login? Without it Meta delivers comments but

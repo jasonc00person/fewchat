@@ -12,7 +12,7 @@ import { customerLine } from "./roster";
 import { ping } from "./live";
 import { enrichPending } from "./media";
 import { findByIgId, sendBubbles } from "./manychat";
-import { midKey, otherLoginMid, react, refreshToken, senderAction, sendText, unifiedToken } from "./meta";
+import { metaBusy, metaHeld, midKey, otherLoginMid, react, refreshToken, senderAction, sendText, unifiedToken } from "./meta";
 import { meter } from "./usage";
 
 export interface Env {
@@ -303,10 +303,13 @@ async function keepTokenFresh(env: Env, now: number): Promise<void> {
 }
 
 export async function tick(env: Env, now: number): Promise<void> {
-  if (env.TRANSPORT === "meta") {
+  // What can wait does while Meta's rate limit holds or the budget is nearly used (RATE_LIMITED in src/meta.ts).
+  if (env.TRANSPORT === "meta" && !metaHeld(now)) {
     await keepTokenFresh(env, now).catch((e) => logError(env.DB, "token refresh", null, e, now));
-    await refreshProfiles(env, now).catch((e) => logError(env.DB, "profiles", null, e, now));
-    await syncRecent(env, now).catch((e) => logError(env.DB, "DM sync", null, e, now)); // DMs the webhook dropped
+    if (!metaBusy(now)) {
+      await refreshProfiles(env, now).catch((e) => logError(env.DB, "profiles", null, e, now));
+      await syncRecent(env, now).catch((e) => logError(env.DB, "DM sync", null, e, now)); // DMs the webhook dropped
+    }
   }
 
   // 1. Expire drafts whose 24h window has closed.
@@ -352,6 +355,8 @@ export async function tick(env: Env, now: number): Promise<void> {
     .bind(now)
     .all<db.Draft>();
   // Fresh ones go to the queue (typing pauses); a draft still pending 90s past due (lost job) is sent right here.
+  // An AI reply that meets Meta's rate limit fails like any failed send (delivery problems on Home): holding it would
+  // age it into settleStuckSends' race and could send it twice.
   for (const draft of due) {
     if (env.SEND_QUEUE && draft.send_after! > now - 90_000) await env.SEND_QUEUE.send({ draft_id: draft.id });
     else await sendDraft(env, draft, now, undefined, { auto: true });

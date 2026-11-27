@@ -3,7 +3,7 @@ import { makeD1 } from "./d1shim";
 import * as db from "../src/db";
 import worker from "../src/index";
 import { hasSession, sessionCookie } from "../src/session";
-import { graph, hmacHex, useAccount } from "../src/meta";
+import { graph, hmacHex, useAccount, useOtherToken } from "../src/meta";
 import type { Env } from "../src/setter";
 
 const OWNER = "17840000000000001";
@@ -272,6 +272,46 @@ describe("graph()", () => {
       "https://graph.facebook.com/v26.0/1784/subscribed_apps?access_token=EAAnew",
     ]);
   });
+
+  it("a message refused as not the thread owner goes once more on the other login, else throws the first error", async () => {
+    const NOT_OWNER = { error: { message: "The action is invalid as it's not the thread owner", code: 100, error_subcode: 2534037 } };
+    const seen: { url: string; auth: string | null; body: string }[] = [];
+    let second: object = { message_id: "aWdfZAold" };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        seen.push({ url, auth: new Headers(init?.headers).get("Authorization"), body: String(init?.body ?? "") });
+        return url.startsWith("https://graph.facebook.com") ? Response.json(NOT_OWNER, { status: 400 }) : Response.json(second, { status: "error" in second ? 400 : 200 });
+      }),
+    );
+    useAccount("1784");
+    const send = (body: object) => graph<{ message_id: string }>("/me/messages", { method: "POST", headers: { Authorization: "Bearer EAAnew", "Content-Type": "application/json" }, body: JSON.stringify(body) });
+
+    useOtherToken(null);
+    await expect(send({ recipient: { id: "5" }, message: { text: "a" } })).rejects.toThrow(/not the thread owner/);
+    expect(seen).toHaveLength(1); // an install that never moved: nothing to retry with
+
+    seen.length = 0;
+    useOtherToken("IGAAold");
+    expect(await send({ recipient: { id: "5" }, message: { text: "b" }, reply_to: { mid: "bmV3X2lnX2RtX2new" } })).toEqual({ message_id: "aWdfZAold" });
+    expect(seen.map((s) => [s.url, s.auth])).toEqual([
+      ["https://graph.facebook.com/v26.0/1784/messages", "Bearer EAAnew"],
+      ["https://graph.instagram.com/v26.0/me/messages", "Bearer IGAAold"],
+    ]);
+    expect(JSON.parse(seen[1].body)).toEqual({ recipient: { id: "5" }, message: { text: "b" } }); // its quote can't cross logins
+
+    seen.length = 0;
+    second = { error: { message: "The action is invalid as it's not the thread owner", code: 100 } }; // Manychat owns it
+    await expect(send({ recipient: { id: "5" }, message: { text: "c" } })).rejects.toThrow(/instagram 400 code 100: The action is invalid/);
+    expect(seen).toHaveLength(2);
+    second = { error: { message: "Application request limit reached", code: 4 } }; // may have gone out: not a refusal
+    await expect(send({ recipient: { id: "5" }, message: { text: "d" } })).rejects.toThrow(/code 4: Application request limit/);
+
+    seen.length = 0;
+    await expect(graph("/me/conversations?user_id=5", { headers: { Authorization: "Bearer EAAnew" } })).rejects.toThrow(); // only messages retry
+    expect(seen).toHaveLength(1);
+    useOtherToken(null);
+  });
 });
 
 describe("moving a live install from Instagram Login to Unified login, with no gap", () => {
@@ -338,16 +378,16 @@ describe("moving a live install from Instagram Login to Unified login, with no g
     expect(await webhook(env, "fbsecret", "u2")).toEqual({ status: 200, stored: true });
   });
 
-  it("subscribes the new app before the switch, stops the old one after, and goes back the same way", async () => {
+  it("subscribes the new app before the switch, leaves the old one only its taps after, and goes back the same way", async () => {
     const env = await live();
     const { done } = await move(env, "/auth/start");
     expect(done.status).toBe(303);
     expect(await db.getSetting(env.DB, "ig_token")).toBe("EAAnew");
     expect(await db.getSetting(env.DB, "ig_token_previous")).toBe("IGAAold");
-    const sub = log.indexOf(`POST https://graph.facebook.com/v26.0/${OWNER}/subscribed_apps?subscribed_fields=messages%2Cmessaging_postbacks%2Cmessaging_seen%2Ccomments%2Clive_comments&access_token=EAAnew`);
-    const unsub = log.indexOf("DELETE https://graph.instagram.com/v26.0/me/subscribed_apps?access_token=IGAAold");
+    const sub = log.indexOf(`POST https://graph.facebook.com/v26.0/${OWNER}/subscribed_apps?subscribed_fields=messages%2Cmessaging_postbacks%2Cmessaging_seen%2Ccomments%2Clive_comments%2Cstandby&access_token=EAAnew`);
+    const taps = log.indexOf("POST https://graph.instagram.com/v26.0/me/subscribed_apps?subscribed_fields=messaging_postbacks&access_token=IGAAold");
     expect(sub).toBeGreaterThan(-1);
-    expect(unsub).toBeGreaterThan(sub);
+    expect(taps).toBeGreaterThan(sub);
     expect(log.some((l) => l.includes("client_id=1571") && l.includes("client_secret=fbsecret"))).toBe(true);
 
     log = [];
@@ -355,8 +395,40 @@ describe("moving a live install from Instagram Login to Unified login, with no g
     const back = await move(env, "/auth/start?login=instagram");
     expect(back.to.origin).toBe("https://www.instagram.com");
     expect(await db.getSetting(env.DB, "ig_token")).toBe("IGAAback");
-    expect(log.some((l) => l.startsWith(`DELETE https://graph.facebook.com/v26.0/${OWNER}/subscribed_apps?access_token=EAAnew`))).toBe(true);
+    expect(log).toContain("POST https://graph.instagram.com/v26.0/me/subscribed_apps?subscribed_fields=messages%2Cmessaging_postbacks%2Cmessaging_seen%2Ccomments%2Clive_comments&access_token=IGAAback");
+    expect(log).toContain(`POST https://graph.facebook.com/v26.0/${OWNER}/subscribed_apps?subscribed_fields=messaging_postbacks&access_token=EAAnew`);
     next = "EAAnew";
+  });
+
+  // Conversation Routing: a thread another app owns (Manychat, or the old login's app for a day after a switch) sends
+  // its events to that app, and to ours under standby. The tap of a card goes to the owner.
+  async function signed(env: Env, secret: string, entry: object) {
+    const body = JSON.stringify({ object: "instagram", entry: [{ id: OWNER, time: 1, ...entry }] });
+    return worker.fetch(new Request("https://x/meta", { method: "POST", body, headers: { "X-Hub-Signature-256": `sha256=${await hmacHex(secret, body)}` } }), env, ctx);
+  }
+  const rows = (env: Env, lead: string) => env.DB.prepare(`SELECT mid, text FROM messages WHERE subscriber_id = ?1 ORDER BY id`).bind(lead).all<{ mid: string; text: string }>().then((r) => r.results);
+
+  it("standby events count like messaging ones: a DM and a tap in a thread another app owns", async () => {
+    const env = await live();
+    await db.setSetting(env.DB, "ig_token", "EAAnew");
+    await signed(env, "fbsecret", { standby: [{ sender: { id: "556" }, recipient: { id: OWNER }, timestamp: 1795800000123, message: { mid: "sb1", text: "yo" } }] });
+    await signed(env, "fbsecret", { standby: [{ sender: { id: "557" }, recipient: { id: OWNER }, timestamp: 1795800000456, postback: { mid: "p1", title: "Send the Link!", payload: "b:999:x" } }] });
+    expect(await rows(env, "556")).toEqual([{ mid: "sb1", text: "yo" }]);
+    expect(await rows(env, "557")).toEqual([{ mid: "pb:557:1795800000456", text: "[tapped] Send the Link!" }]);
+  });
+
+  it("the other login's app counts for its taps only, and a tap that reaches both apps is one tap", async () => {
+    const env = await live();
+    await db.setSetting(env.DB, "ig_token", "EAAnew");
+    await db.setSetting(env.DB, "ig_token_previous", "IGAAold");
+    // The same tap through each app: its id in each login's encoding, its time a few ms apart.
+    const KEY = `${OWNER}:340282366841710301244259842834358898851:7406112233445566`;
+    const id = (prefix: string) => Buffer.from(`${prefix}item:1:IGMessageID:${KEY}`).toString("base64url");
+    const tap = (mid: string, at: number) => ({ sender: { id: "558" }, recipient: { id: OWNER }, timestamp: at, postback: { mid, title: "Send the Link!", payload: "b:999:x" } });
+    expect((await signed(env, "appsecret", { messaging: [tap(id("ig_dm_"), 1795800000789)] })).status).toBe(200);
+    expect(await signed(env, "fbsecret", { standby: [tap(id("new_ig_dm_"), 1795800000792)] }).then((r) => r.status)).toBe(200);
+    expect(await rows(env, "558")).toEqual([{ mid: `pb:558:${KEY}`, text: "[tapped] Send the Link!" }]);
+    expect(await webhook(env, "appsecret", "i3")).toEqual({ status: 200, stored: false }); // its DMs still don't
   });
 
   it("refuses the move when the Page the account is linked to wasn't shared: nothing changes", async () => {

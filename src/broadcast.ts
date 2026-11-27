@@ -107,7 +107,7 @@ export async function runBroadcasts(env: Env, now: number): Promise<void> {
     let failed = 0;
     for (const { subscriber_id } of picks) {
       try {
-        await startFlow(env, token, id, subscriber_id, Date.now());
+        await startFlow(env, token, id, subscriber_id, Date.now(), null, null, false); // a rate limit pauses it (below)
       } catch (e) {
         failed++;
         await logError(env.DB, "broadcast", `#${id} ${subscriber_id}`, e, now);

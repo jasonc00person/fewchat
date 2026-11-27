@@ -502,6 +502,8 @@ const ago = (ms) => {
 // ------------------------------------------------------------------------------------- your own page of instructions
 
 const WEBHOOK_FIELDS = ["messages", "messaging_postbacks", "messaging_seen", "messaging_referral", "message_reactions", "message_edit", "comments", "live_comments"];
+// Unified login also needs standby: a thread another app owns (Manychat's, say) sends our app its events there.
+const UNIFIED_FIELDS = [...WEBHOOK_FIELDS, "standby"];
 // Where MY-SETUP.md covers publishing the app, and what to do about a webhook that isn't set: the two usual causes.
 const notLive = (c) => (c.login === "unified" ? "step 8" : "step 9");
 const noHook = (c) => (c.login === "unified" ? "its webhook isn't set (`npm run setup` sets it again)" : "its webhook wasn't saved (step 5)");
@@ -671,10 +673,10 @@ async function connectWebhook(c) {
   // (webhookAnswers already retries for about half a minute).
   if (!(await webhookAnswers(c))) return warn("Your FewChat address isn't answering yet, so the webhook can't be set. Run `npm run setup` again in a few minutes: it picks up here.");
   const verifyToken = readEnv().META_VERIFY_TOKEN ?? "";
-  const res = await graphApp(c, "POST", `/${c.instagram_app_id}/subscriptions`, { object: "instagram", callback_url: `${c.url}/meta`, verify_token: verifyToken, fields: WEBHOOK_FIELDS.join(",") });
+  const res = await graphApp(c, "POST", `/${c.instagram_app_id}/subscriptions`, { object: "instagram", callback_url: `${c.url}/meta`, verify_token: verifyToken, fields: UNIFIED_FIELDS.join(",") });
   if (!res.success) {
     warn(`Meta didn't take the webhook (${res.error?.message ?? "no answer"}). Run \`npm run setup\` again: it's safe. If it keeps refusing, set it by hand once:`);
-    return info(`API setup with Unified login → 3. Configure webhooks: callback ${c.url}/meta, verify token ${verifyToken}, Verify and save, then switch on ${WEBHOOK_FIELDS.join(", ")}.`);
+    return info(`API setup with Unified login → 3. Configure webhooks: callback ${c.url}/meta, verify token ${verifyToken}, Verify and save, then switch on ${UNIFIED_FIELDS.join(", ")}.`);
   }
   const back = await graphApp(c, "GET", `/${c.instagram_app_id}/subscriptions`);
   if (webhookSet(back)) return ok("Webhook set on your Meta app (your DMs and comments come here)");

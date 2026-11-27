@@ -5,7 +5,7 @@ import { isTest } from "./db";
 import { alert, DB_BLIP, logError } from "./health";
 import { recordBot, startCommentFlow } from "./flows";
 import { dmKeywordOwner, dmWords, MAX_TRIGGERS, moreOf, type ExtraTrigger } from "./graph";
-import { recentMedia, replyToComment, type MetaComment } from "./meta";
+import { metaHeld, recentMedia, replyToComment, type MetaComment } from "./meta";
 import { pace, type Env } from "./setter";
 
 export interface Trigger {
@@ -364,6 +364,8 @@ export async function drainComments(db: D1Database, token: string | null, skoolL
     .bind(now, room - throttledRoom, throttledRoom)
     .all<{ comment_id: string; subscriber_id: string; username: string | null; media_id: string | null; text: string; trigger_id: number; created_at: number }>();
   for (const r of results) {
+    // Meta's rate limit came back mid-pass: the rest keep their tries (and their own error) for after it.
+    if (metaHeld()) break;
     const trigger = await db.prepare(`SELECT * FROM triggers WHERE id = ?1 AND enabled = 1 AND deleted_at IS NULL`).bind(r.trigger_id).first<Trigger>();
     if (!trigger) {
       await db.prepare(`UPDATE comments SET status = 'ignored' WHERE comment_id = ?1`).bind(r.comment_id).run();

@@ -13,7 +13,7 @@ import { fillMessageKeys, getLead, getSetting, recordInbound, setSetting } from 
 import { flowClick, flowSignals, handlePostback, handleRead, inboundFlow, parsePostbacks, parseReads, pendingFlow, resumeInbound, runDueFlows } from "./flows";
 import { handleClick } from "./links";
 import { getSubscriber, parseInbound } from "./manychat";
-import { authorizeUrl, exchangeCode, exchangeUnified, graph, fetchProfile, parseComments, parseMessageUpdates, parseParts, parseReplies, parseSignedRequest, parseWebhook, pageShared, subscribe, unifiedToken, unsubscribe, useAccount, verifySignature } from "./meta";
+import { authorizeUrl, exchangeCode, exchangeUnified, graph, graphUnheld, fetchProfile, parseComments, parseMessageUpdates, parseParts, parseReplies, parseSignedRequest, parseWebhook, pageShared, subscribe, subscribeTaps, unifiedToken, metaBusy, metaHeld, useAccount, useMetaState, useOtherToken, verifySignature } from "./meta";
 import { applyUpdate, mediaRoute, saveParts, saveReplyTo } from "./attachments";
 import { legalPage } from "./pages";
 import { saveProfile } from "./profiles";
@@ -40,10 +40,16 @@ async function handleMeta(req: Request, env: Env, ctx: ExecutionContext): Promis
   const signature = req.headers.get("X-Hub-Signature-256");
   const token = await getSetting(env.DB, "ig_token");
   // Signed by the app whose token is in use: handle it. An install moving between logins has both apps subscribed for
-  // a moment (no gap), so a valid signature from the other app is acknowledged and dropped: nothing runs twice.
+  // a moment (no gap), so the other app's webhooks count only for its taps: a tap goes to the app that owns the thread,
+  // which for a day after a switch is often the old one, and nothing else of its (DMs, echoes, comments) runs twice. A
+  // tap that reaches both apps still runs once (flow_taps).
   if (!(await verifySignature(inUseSecret(env, token), raw, signature))) {
     const other = env.META_UNIFIED_APP_SECRET && (await verifySignature(unifiedToken(token) ? env.META_APP_SECRET : env.META_UNIFIED_APP_SECRET, raw, signature));
-    return other ? new Response("ok (the other login)") : new Response("bad signature", { status: 401 });
+    if (!other) return new Response("bad signature", { status: 401 });
+    const taps = token ? parsePostbacks(JSON.parse(raw)) : [];
+    for (const pb of taps) await handlePostback(env, token!, pb, Date.now());
+    ctx.waitUntil(Promise.all(taps.map((pb) => ping(env, pb.lead_id))));
+    return new Response("ok (the other login)");
   }
   await webhookSeen(env.DB, Date.now()); // so a silent webhook can be noticed (src/health.ts)
   const payload = JSON.parse(raw);
@@ -83,8 +89,14 @@ async function handleMeta(req: Request, env: Env, ctx: ExecutionContext): Promis
 
 // The account id a Unified login token addresses in place of "me" (src/meta.ts), set before anything calls Instagram.
 // An install that never uses Unified login reads nothing for it.
+// Also Meta's rate-limit hold and the last busy reading (src/meta.ts), the same one query.
 async function login(env: Env): Promise<void> {
-  useAccount(env.META_LOGIN_CONFIG_ID ? await getSetting(env.DB, "ig_account_id") : null);
+  const { results } = await env.DB.prepare(`SELECT key, value FROM settings WHERE key IN ('ig_token', 'ig_account_id', 'ig_token_previous', 'meta_hold', 'meta_usage')`).all<{ key: string; value: string }>();
+  const s = new Map(results.map((r) => [r.key, r.value]));
+  const unified = Boolean(env.META_LOGIN_CONFIG_ID);
+  useAccount(unified ? (s.get("ig_account_id") ?? null) : null);
+  useOtherToken(unified ? (s.get("ig_token_previous") ?? null) : null); // sends in threads the other login's app still owns
+  useMetaState(env.DB, s.get("meta_hold"), s.get("meta_usage"), s.get("ig_token")); // which login's hold applies
 }
 
 // The Unified login app. A fresh install has one app (META_IG_APP_ID / META_APP_SECRET); an install moving over from
@@ -156,7 +168,7 @@ async function handleAuth(req: Request, env: Env, pathname: string): Promise<Res
     if (login) {
       // Compare Instagram account ids from /me: OAuth's user_id is app-scoped and arrives as a lossy JSON number.
       const owner = await ownerId(env).catch(() => null);
-      const me = unified?.me ?? (await graph<{ user_id: string; username?: string }>(`/me?fields=user_id,username`, { headers: { Authorization: `Bearer ${token}` } }));
+      const me = unified?.me ?? (await graphUnheld<{ user_id: string; username?: string }>(`/me?fields=user_id,username`, { headers: { Authorization: `Bearer ${token}` } }));
       const who = me.user_id;
       if (owner && who !== owner) return withCleared(loginPage("That Instagram account isn't the one this setter runs.", req));
       // The very first sign-in on a fresh install claims it, so only the account it was set up for (brand.ts) may.
@@ -178,7 +190,7 @@ async function handleAuth(req: Request, env: Env, pathname: string): Promise<Res
     }
     // Same account? Compared by the account id, which both logins share (ig_user_id is app-scoped under Instagram Login).
     const owner = await getSetting(env.DB, "ig_account_id");
-    const account = unified ? unified.userId : owner ? (await graph<{ user_id: string }>(`/me?fields=user_id`, { headers: { Authorization: `Bearer ${token}` } })).user_id : null;
+    const account = unified ? unified.userId : owner ? (await graphUnheld<{ user_id: string }>(`/me?fields=user_id`, { headers: { Authorization: `Bearer ${token}` } })).user_id : null;
     const primary = await getSetting(env.DB, "ig_user_id");
     if (owner ? account !== owner : primary && primary !== userId) {
       // A second account (Meta's App Review tester) is shown in /admin but never replaces the live one.
@@ -202,7 +214,8 @@ async function handleAuth(req: Request, env: Env, pathname: string): Promise<Res
     if (unified) await setSetting(env.DB, "ig_account_id", userId); // every later request addresses the account by it
     if (moving) {
       await setSetting(env.DB, "ig_token_previous", previous!); // what to go back to, with /auth/start
-      await unsubscribe(previous!).catch((e) => console.error("old login's subscription stays (its webhooks are ignored):", e));
+      useOtherToken(previous!);
+      await subscribeTaps(previous!).catch((e) => console.error("old login's subscription stays as it was (only its taps count):", e));
     }
   } catch (e) {
     console.error("instagram login/connect failed:", e);
@@ -336,16 +349,18 @@ export default {
           cronStep(e, "setter", Date.now(), () => tick(e, Date.now())),
           cronStep(e, "flow delays", Date.now(), () => runDueFlows(e, Date.now())),
           cronStep(e, "resume", Date.now(), () => resumeInbound(e, Date.now())), // DMs and taps a database restart cut off
-          cronStep(e, "broadcasts", Date.now(), () => runBroadcasts(e, Date.now())), // a few a minute, inside the 24h window only
+          // While Meta's rate limit holds (or the budget is nearly used), what can wait does; see RATE_LIMITED in src/meta.ts.
+          cronStep(e, "broadcasts", Date.now(), async () => metaBusy() || runBroadcasts(e, Date.now())), // a few a minute, inside the 24h window only
           cronStep(e, "skool joins", Date.now(), () => syncJoins(e, Date.now())), // new Skool members, matched to their DM lead
           cronStep(e, "skool roster", Date.now(), () => syncRoster(e, Date.now())), // members + churned, so the setter never pitches a customer
           cronStep(e, "skool facts", Date.now(), () => refreshCommunity(e, Date.now())), // call times, size, activity, classroom
           cronStep(e, "learn", Date.now(), () => learnFromHandoffs(e, Date.now())), // The owner's own answers to handoffs become knowledge
           cronStep(e, "funnel moves", Date.now(), () => refreshMoves(e, Date.now())), // the funnel's furthest move per lead
-          cronStep(e, "comment queue", Date.now(), async () => drainComments(e.DB, await getSetting(e.DB, "ig_token"), e.SKOOL_LINK, Date.now())),
-          cronStep(e, "comment backfill", Date.now(), () => syncComments(e, Date.now())), // comments the webhook missed
-          cronStep(e, "backlog replies", Date.now(), async () => tellBacklog(e, await getSetting(e.DB, "ig_token"), Date.now())), // refused comments from before the DM-keyword reply, one a minute
-          cronStep(e, "next post", Date.now(), async () => lockNextPost(e.DB, await getSetting(e.DB, "ig_token"), Date.now())), // a Next Post or Reel trigger finds its post
+          // Held, a retry would only use up one of the comment's tries.
+          cronStep(e, "comment queue", Date.now(), async () => metaHeld() || drainComments(e.DB, await getSetting(e.DB, "ig_token"), e.SKOOL_LINK, Date.now())),
+          cronStep(e, "comment backfill", Date.now(), async () => metaBusy() || syncComments(e, Date.now())), // comments the webhook missed
+          cronStep(e, "backlog replies", Date.now(), async () => metaBusy() || tellBacklog(e, await getSetting(e.DB, "ig_token"), Date.now())), // refused comments from before the DM-keyword reply, one a minute
+          cronStep(e, "next post", Date.now(), async () => metaHeld() || lockNextPost(e.DB, await getSetting(e.DB, "ig_token"), Date.now())), // a Next Post or Reel trigger finds its post
           cronStep(e, "message keys", Date.now(), () => fillMessageKeys(e.DB)), // messages.mkey: finds a message by either login's id
           cronStep(e, "health", Date.now(), () => checkHealth(e, Date.now())),
         ]),

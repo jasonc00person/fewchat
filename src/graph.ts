@@ -428,7 +428,11 @@ export async function publish(d: D1Database, id: number, g: Graph, now: number):
       )
       .bind(id, t.source, t.keyword, t.media_id, t.public_reply, firstText(g), now, g.more.length ? JSON.stringify(g.more) : null),
     d
-      .prepare(`UPDATE flow_runs SET status = 'cancelled' WHERE trigger_id = ?1 AND status = 'scheduled' AND COALESCE(node_id, '') NOT IN (SELECT value FROM json_each(?2))`)
+      // A message Meta's rate limit stopped waits as "rl:<bubble>:<node>" (src/flows.ts parkLimited): judged by its node.
+      .prepare(
+        `UPDATE flow_runs SET status = 'cancelled' WHERE trigger_id = ?1 AND status = 'scheduled'
+         AND (CASE WHEN node_id LIKE 'rl:%' THEN substr(node_id, instr(substr(node_id, 4), ':') + 4) ELSE COALESCE(node_id, '') END) NOT IN (SELECT value FROM json_each(?2))`,
+      )
       .bind(id, JSON.stringify(g.nodes.map((n) => n.id))),
   ]);
 }

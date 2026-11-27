@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { makeD1 } from "./d1shim";
 import { runBroadcasts, type Broadcast } from "../src/broadcast";
 import * as db from "../src/db";
+import { useMetaState } from "../src/meta";
 import type { Env } from "../src/setter";
 
 const MIN = 60_000;
@@ -52,6 +53,7 @@ beforeEach(() => {
   );
 });
 afterEach(() => {
+  useMetaState(null, null, null); // a refused send holds every call (src/meta.ts): not into the next test
   vi.unstubAllGlobals();
   vi.useRealTimers();
 });

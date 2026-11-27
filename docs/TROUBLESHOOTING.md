@@ -77,6 +77,8 @@ These are the steps in `MY-SETUP.md`. The step number is where to look.
 
 ## Everything stopped at once
 
+**"Application request limit reached" (code 4) in Problems, or a phone alert saying "Meta's rate limit"**: Meta caps how many calls your Meta app can make, and a post that blows up can use it up (it happened to an account sending about 400 comment DMs an hour, ten minutes after it moved to Unified login). When Instagram says so, FewChat stops calling it for 5 minutes (longer each time it happens again, up to an hour, or as long as Meta says), so it can't make things worse. Nothing is lost while it waits: comment DMs queue, automation messages wait and continue from where they stopped, and broadcasts pause themselves. You'll see the alert at most once an hour. Don't restart or redeploy to "fix" it; it clears by itself. While Meta reports your app over 75% of its budget, FewChat also skips what can wait (profile pictures, the missed-message check, broadcasts) so the rest goes to replies.
+
 On Cloudflare's free plan the database can only read and write so much per day. A busy inbox uses it up, and then the console, your automations and incoming messages all pause until midnight UTC. Nothing is lost: missed comments and messages are picked up afterwards. The fix is Workers Paid ($5 a month), which FewChat needs for real use anyway: dash.cloudflare.com → Workers & Pages → Plans.
 
 ## Updating

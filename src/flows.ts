@@ -12,7 +12,7 @@ import * as db from "./db";
 import { DB_BLIP, logError } from "./health";
 import { findByName, loadGraph, moreOf, publish, triggersOf, type ActionItem, type Bubble, type Graph, type MessageData, type Node, type QuickReply, type Rule, type Variant } from "./graph";
 import { fillLink } from "./manychat";
-import { fetchProfile, graph, midKey, senderAction, subscribe, type MetaEvent } from "./meta";
+import { fetchProfile, graph, messagingOf, metaHeld, metaHeldUntil, midKey, RATE_LIMITED, senderAction, subscribe, type MetaEvent, type Routed } from "./meta";
 import { pace, type Env } from "./setter";
 
 const INLINE_DELAY_S = 15; // webhook work gets about 30s after the response
@@ -58,16 +58,13 @@ export interface Signal {
   mention: boolean;
 }
 
-interface RawEntry {
-  id?: string;
-  messaging?: {
-    sender?: { id?: string };
-    timestamp?: number;
-    read?: { mid?: string };
-    message?: { mid?: string; text?: string; is_echo?: boolean; quick_reply?: { payload?: string }; reply_to?: { story?: { id?: string } }; attachments?: { type?: string }[] };
-    postback?: { mid?: string; title?: string; payload?: string };
-  }[];
-}
+type RawEntry = { id?: string } & Routed<{
+  sender?: { id?: string };
+  timestamp?: number;
+  read?: { mid?: string };
+  message?: { mid?: string; text?: string; is_echo?: boolean; quick_reply?: { payload?: string }; reply_to?: { story?: { id?: string } }; attachments?: { type?: string }[] };
+  postback?: { mid?: string; title?: string; payload?: string };
+}>;
 
 const entries = (payload: unknown): RawEntry[] => {
   const p = payload as { object?: string; entry?: RawEntry[] };
@@ -77,7 +74,7 @@ const entries = (payload: unknown): RawEntry[] => {
 export function flowSignals(payload: unknown): Map<string, Signal> {
   const out = new Map<string, Signal>();
   for (const entry of entries(payload)) {
-    for (const ev of entry.messaging ?? []) {
+    for (const ev of messagingOf(entry)) {
       const m = ev.message;
       if (!m?.mid || m.is_echo) continue;
       out.set(m.mid, {
@@ -98,16 +95,17 @@ export interface Postback {
   title: string;
   payload: string;
   at: number;
+  key: string | null; // the tap's own <account>:<thread>:<item>, the same whichever app it reached (midKey)
 }
 
 export function parsePostbacks(payload: unknown): Postback[] {
   const out: Postback[] = [];
   for (const entry of entries(payload)) {
-    for (const ev of entry.messaging ?? []) {
+    for (const ev of messagingOf(entry)) {
       const pb = ev.postback;
       const lead_id = ev.sender?.id;
       if (!pb?.payload || !lead_id || lead_id === entry.id) continue;
-      out.push({ lead_id, title: pb.title ?? "", payload: pb.payload, at: ev.timestamp ?? Date.now() });
+      out.push({ lead_id, title: pb.title ?? "", payload: pb.payload, at: ev.timestamp ?? Date.now(), key: midKey(pb.mid) });
     }
   }
   return out;
@@ -124,7 +122,7 @@ export interface Read {
 export function parseReads(payload: unknown): Read[] {
   const out: Read[] = [];
   for (const entry of entries(payload)) {
-    for (const ev of entry.messaging ?? []) {
+    for (const ev of messagingOf(entry)) {
       const lead_id = ev.sender?.id;
       if (!ev.read?.mid || !lead_id || lead_id === entry.id) continue;
       out.push({ lead_id, mid: ev.read.mid, at: ev.timestamp ?? Date.now() });
@@ -226,8 +224,9 @@ export async function sendFlowMessage(
     res = await post(token, recipient, built.message);
   } catch (e) {
     // Meta only documents text for private replies to comments. If a template is refused there, a failed call
-    // doesn't use up the one reply: send the text with the links inline instead.
-    if (!("comment_id" in recipient) || !("attachment" in built.message || "quick_replies" in built.message)) {
+    // doesn't use up the one reply: send the text with the links inline instead. Not for a rate limit: that's no
+    // refusal of the template, and the comment queue sends the card itself later.
+    if (!("comment_id" in recipient) || !("attachment" in built.message || "quick_replies" in built.message) || RATE_LIMITED.test(String(e))) {
       await fail(e);
       throw e;
     }
@@ -281,9 +280,22 @@ interface Run {
   typing: boolean; // a short pause ran in this walk: every message after it is typed out (dots, then the text), not pasted
   slept: number; // ms this walk has spent pausing and typing
   budget: number; // steps left: a loop in the graph can't spin forever
+  resume?: { node: string; bubble: number }; // picking up a message Meta's rate limit stopped part way (parkLimited)
+  park?: boolean; // false: a rate limit throws instead (a broadcast pauses itself on it rather than queue its list)
 }
 
-const target = (g: Graph, from: string, port: string) => g.edges.find((e) => e.from === from && e.port === port)?.to ?? null;
+// Meta's rate limit stopped a message: everything already sent stays sent, and the rest of the walk waits in
+// flow_runs (as "rl:<bubble>:<node>") until the hold lifts, then the cron goes on from that bubble. Unlike a smart
+// delay it isn't cancelled when they write meanwhile: they asked for it (a tap, a keyword) and haven't had it yet.
+const LIMITED_PREFIX = "rl:";
+async function parkLimited(run: Run, node: string, bubble: number): Promise<void> {
+  const at = Math.max(metaHeldUntil(), run.now) + Math.floor(Math.random() * 60_000); // spread out, not all in one minute
+  await run.env.DB.prepare(`INSERT INTO flow_runs (trigger_id, subscriber_id, after_position, node_id, after_msg_id, run_at, created_at) VALUES (?1, ?2, 0, ?3, ?4, ?5, ?6)`)
+    .bind(run.t.id, run.lead, `${LIMITED_PREFIX}${bubble}:${node}`, Number.MAX_SAFE_INTEGER, at, run.now)
+    .run();
+}
+
+const target =(g: Graph, from: string, port: string) => g.edges.find((e) => e.from === from && e.port === port)?.to ?? null;
 
 async function lastLeadText(d: D1Database, lead: string): Promise<string> {
   const row = await d.prepare(`SELECT text FROM messages WHERE subscriber_id = ?1 AND role = 'lead' ORDER BY id DESC LIMIT 1`).bind(lead).first<{ text: string }>();
@@ -295,7 +307,8 @@ async function follows(token: string, lead: string): Promise<boolean> {
   try {
     const p = await graph<{ is_user_follow_business?: boolean }>(`/${lead}?fields=is_user_follow_business`, { headers: { Authorization: `Bearer ${token}` } });
     return p.is_user_follow_business === true;
-  } catch {
+  } catch (e) {
+    if (RATE_LIMITED.test(String(e))) throw e; // not a "no": the walk waits at this condition (walkAt)
     return false;
   }
 }
@@ -344,7 +357,10 @@ async function step(run: Run, n: Node): Promise<string | null> {
         return null;
       }
       if (!inWindow(await db.getLead(d, run.lead), run.now)) return null;
+      const from = run.resume?.node === n.id ? run.resume.bubble : 0;
+      run.resume = undefined;
       for (const [i, b] of bubbles.entries()) {
+        if (i < from) continue;
         const ms = flowTypingMs(b.text);
         // Out of time for this walk: the rest still goes out, just without the dots.
         if (run.typing && run.slept + ms <= WALK_SLEEP_MS) {
@@ -353,7 +369,14 @@ async function step(run: Run, n: Node): Promise<string | null> {
           run.now += ms;
           run.slept += ms;
         }
-        const sent = await sendFlowMessage(run.env, run.token, { id: run.lead }, run.lead, run.t.id, n.id, i, b, i === bubbles.length - 1 ? m.quick_replies : [], run.now);
+        let sent: Sent;
+        try {
+          sent = await sendFlowMessage(run.env, run.token, { id: run.lead }, run.lead, run.t.id, n.id, i, b, i === bubbles.length - 1 ? m.quick_replies : [], run.now);
+        } catch (e) {
+          if (!RATE_LIMITED.test(String(e)) || run.park === false) throw e;
+          await parkLimited(run, n.id, i);
+          return null;
+        }
         await recordBot(d, run.lead, sent.text, sent.mid, run.now).run();
       }
       return target(run.g, n.id, "next");
@@ -419,14 +442,27 @@ async function step(run: Run, n: Node): Promise<string | null> {
 
 // Follows the edge out of (from, port) and keeps going. False = nothing connected there.
 async function walk(run: Run, from: string, port: string): Promise<boolean> {
-  let id = target(run.g, from, port);
+  const id = target(run.g, from, port);
   if (!id) return false;
+  await walkAt(run, id);
+  return true;
+}
+
+// From this node itself on. A rate limit in any other step (a follow check) waits at that step the same way a message
+// does (parkLimited); a comment's first walk lets it through to the comment queue, and a broadcast to its own pause.
+async function walkAt(run: Run, start: string): Promise<void> {
+  let id: string | null = start;
   while (id && run.budget-- > 0) {
     const n = run.g.nodes.find((x) => x.id === id);
     if (!n) break;
-    id = await step(run, n);
+    try {
+      id = await step(run, n);
+    } catch (e) {
+      if (!RATE_LIMITED.test(String(e)) || run.park === false || run.comment !== null) throw e;
+      await parkLimited(run, n.id, 0);
+      return;
+    }
   }
-  return true;
 }
 
 const makeRun = async (env: FlowEnv, token: string, t: Trigger, lead: string, now: number, extra: Partial<Run> = {}): Promise<Run> => ({
@@ -476,10 +512,10 @@ async function enter(env: FlowEnv, token: string, t: Trigger, lead: string, now:
   return run;
 }
 
-export async function startFlow(env: FlowEnv, token: string, triggerId: number, leadId: string, now: number, text: string | null = null, via: string | null = null): Promise<boolean> {
+export async function startFlow(env: FlowEnv, token: string, triggerId: number, leadId: string, now: number, text: string | null = null, via: string | null = null, park = true): Promise<boolean> {
   const t = await getTrigger(env.DB, triggerId);
   if (!live(t)) return false;
-  return Boolean(await enter(env, token, t, leadId, now, { text }, via));
+  return Boolean(await enter(env, token, t, leadId, now, { text, park }, via));
 }
 
 // Comment-to-DM: the flow's first message goes out as the private reply. Null = nothing sent (already ran for them,
@@ -574,7 +610,8 @@ export async function handleInboundFlow(env: Env, token: string, ev: MetaEvent, 
 export async function handlePostback(env: Env, token: string, pb: Postback, now: number): Promise<void> {
   const known = await db.getLead(env.DB, pb.lead_id);
   const profile = known?.username ? { username: known.username, name: null } : await fetchProfile(token, pb.lead_id);
-  const mid = `pb:${pb.lead_id}:${pb.at}`;
+  // One row per tap even when both logins' apps deliver it (src/index.ts): by the tap's own key where it has one.
+  const mid = `pb:${pb.lead_id}:${pb.key ?? pb.at}`;
   const fresh = await db.recordInbound(
     env.DB,
     { subscriber_id: pb.lead_id, username: profile.username, first_name: profile.name, text: `[tapped] ${pb.title}`.trim(), mid, pending: pendingFlow({ tap: pb.payload }, now) },
@@ -611,6 +648,7 @@ export const inboundFlow = (env: Env, token: string, ev: MetaEvent, sig: Signal 
 
 // Cron: DMs and taps whose automation the database cut off, and messages left "sending" by one.
 export async function resumeInbound(env: Env, now: number): Promise<number> {
+  if (metaHeld(now)) return 0; // Meta's rate limit: they wait (src/meta.ts)
   await env.DB.prepare(`UPDATE flow_sends SET status = 'failed', error = 'interrupted: the database restarted mid-send' WHERE status = 'sending' AND created_at < ?1`)
     .bind(now - 10 * 60_000)
     .run();
@@ -640,7 +678,9 @@ export async function resumeInbound(env: Env, now: number): Promise<number> {
 
 // Cron: smart delays that are due. Cancelled when the lead has said anything since (they're in a live chat now).
 export async function runDueFlows(env: Env, now: number): Promise<void> {
-  const { results } = await env.DB.prepare(`SELECT * FROM flow_runs WHERE status = 'scheduled' AND run_at <= ?1 ORDER BY id`)
+  if (metaHeld(now)) return; // Meta's rate limit: they wait (src/meta.ts)
+  // A batch a minute, so what a rate limit parked (parkLimited) doesn't all go out in the minute it lifts.
+  const { results } = await env.DB.prepare(`SELECT * FROM flow_runs WHERE status = 'scheduled' AND run_at <= ?1 ORDER BY run_at, id LIMIT 100`)
     .bind(now)
     .all<{ id: number; trigger_id: number; subscriber_id: string; after_position: number; node_id: string | null; after_msg_id: number }>();
   if (!results.length) return;
@@ -654,6 +694,15 @@ export async function runDueFlows(env: Env, now: number): Promise<void> {
     const t = await getTrigger(env.DB, r.trigger_id);
     if (moved || !token || !live(t)) {
       await env.DB.prepare(`UPDATE flow_runs SET status = 'cancelled' WHERE id = ?1`).bind(r.id).run();
+      continue;
+    }
+    const limited = r.node_id?.startsWith(LIMITED_PREFIX) ? r.node_id.slice(LIMITED_PREFIX.length).match(/^(\d+):(.+)$/) : null;
+    if (limited) {
+      // A message the rate limit stopped: on from that bubble (and if the limit is back, it parks itself again).
+      const resume = { node: limited[2], bubble: Number(limited[1]) };
+      await makeRun(env, token, t, r.subscriber_id, now, { resume })
+        .then((run) => walkAt(run, resume.node))
+        .catch((e) => logError(env.DB, "flow run", `run ${r.id} #${r.trigger_id}`, e, now));
       continue;
     }
     const step = r.node_id
