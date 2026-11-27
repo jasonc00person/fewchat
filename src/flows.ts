@@ -12,7 +12,7 @@ import * as db from "./db";
 import { DB_BLIP, logError } from "./health";
 import { findByName, loadGraph, moreOf, publish, triggersOf, type ActionItem, type Bubble, type Graph, type MessageData, type Node, type QuickReply, type Rule, type Variant } from "./graph";
 import { fillLink } from "./manychat";
-import { fetchProfile, graph, senderAction, subscribe, type MetaEvent } from "./meta";
+import { fetchProfile, graph, midKey, senderAction, subscribe, type MetaEvent } from "./meta";
 import { pace, type Env } from "./setter";
 
 const INLINE_DELAY_S = 15; // webhook work gets about 30s after the response
@@ -134,7 +134,10 @@ export function parseReads(payload: unknown): Read[] {
 }
 
 export async function handleRead(d: D1Database, r: Read): Promise<void> {
-  const seen = await d.prepare(`SELECT created_at FROM messages WHERE mid = ?1 AND subscriber_id = ?2`).bind(r.mid, r.lead_id).first<{ created_at: number }>();
+  const seen = await d
+    .prepare(`SELECT created_at FROM messages WHERE (mid = ?1 OR mkey = ?3) AND +subscriber_id = ?2`) // +: by id, not the whole thread
+    .bind(r.mid, r.lead_id, midKey(r.mid))
+    .first<{ created_at: number }>();
   await d
     .prepare(`UPDATE flow_sends SET seen_at = ?3 WHERE subscriber_id = ?1 AND status = 'sent' AND seen_at IS NULL AND created_at <= ?2`)
     .bind(r.lead_id, seen?.created_at ?? r.at, r.at)
@@ -246,11 +249,16 @@ export async function sendFlowMessage(
   return { mid: res.message_id, text, lead_id };
 }
 
-// Our row wins over the echo: if the echo landed first it stored "[template]", so overwrite the text.
+// Our row wins over the echo: if the echo landed first it stored "[template]", so overwrite the text. An echo under the
+// other login's id (around a switch) is the same message: no second row.
 export const recordBot = (d: D1Database, leadId: string, text: string, mid: string, now: number) =>
   d
-    .prepare(`INSERT INTO messages (subscriber_id, role, text, created_at, mid) VALUES (?1, 'bot', ?2, ?3, ?4) ON CONFLICT (mid) DO UPDATE SET text = excluded.text`)
-    .bind(leadId, text, now, mid);
+    .prepare(
+      `INSERT INTO messages (subscriber_id, role, text, created_at, mid, mkey) SELECT ?1, 'bot', ?2, ?3, ?4, ?5
+       WHERE ?5 IS NULL OR NOT EXISTS (SELECT 1 FROM messages WHERE mkey = ?5 AND mid IS NOT ?4)
+       ON CONFLICT (mid) DO UPDATE SET text = excluded.text`,
+    )
+    .bind(leadId, text, now, mid, midKey(mid));
 
 const inWindow = (lead: db.Lead | null, now: number) => Boolean(lead?.last_inbound_at && now - lead.last_inbound_at <= db.WINDOW_MS);
 

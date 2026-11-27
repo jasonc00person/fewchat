@@ -80,6 +80,35 @@ describe("private reply queue", () => {
     expect((await status(env, "c2")).status).toBe("sent");
   });
 
+  // Each matched comment checks the budget. Counting the whole hour on every check read up to 700 × 700 rows an hour on
+  // a viral post, so the cron saves the part of the hour older than 20 minutes and a comment counts the rest live.
+  it("the budget check uses the cron's count without ever reading low, and recounts when it's stale", async () => {
+    const env = await setup();
+    const sent = (n: number, prefix: string, at: number) =>
+      env.DB.batch(
+        Array.from({ length: n }, (_, i) =>
+          env.DB.prepare(`INSERT INTO comments (comment_id, subscriber_id, text, status, created_at, sent_at) VALUES (?1, ?2, 'x', 'sent', ?3, ?3)`).bind(`${prefix}${i}`, `${prefix}${i}`, at),
+        ),
+      );
+    await sent(HOURLY_BUDGET - 20, "old", T - 30 * MIN);
+    await drainComments(env.DB, "tok", env.SKOOL_LINK, T);
+    expect(await db.getSetting(env.DB, "comment_sent_hour")).toBe(`${HOURLY_BUDGET - 20}:${T}`);
+    // A drain or backfill pass stamped before the count and written after it: still counted.
+    await sent(10, "late", T - 5 * MIN);
+    for (let i = 1; i <= 11; i++) await handleComment(env.DB, "tok", env.SKOOL_LINK, comment(`c${i}`), T + i * 1000);
+    expect(privateReplies()).toHaveLength(10); // 680 + 10 late + 10 sent now = the budget: the 11th waits
+    expect((await status(env, "c11")).status).toBe("queued");
+    // A backfill pass whose time is older than the saved count reads it too, and doesn't overwrite it.
+    await handleComment(env.DB, "tok", env.SKOOL_LINK, comment("c12"), T - MIN);
+    expect((await status(env, "c12")).status).toBe("queued");
+    expect(await db.getSetting(env.DB, "comment_sent_hour")).toBe(`${HOURLY_BUDGET - 20}:${T}`); // read, never recounted
+
+    // Past 2 minutes old the saved count isn't trusted: a recount, which also sees the old hour roll off.
+    await handleComment(env.DB, "tok", env.SKOOL_LINK, comment("c13"), T + 31 * MIN);
+    expect((await status(env, "c13")).status).toBe("sent");
+    expect(await db.getSetting(env.DB, "comment_sent_hour")).toBe(`20:${T + 31 * MIN}`); // the 680 rolled off; the 20 from around T are older than 20 min
+  });
+
   it("a rate-limit refusal retries with backoff; a permanent error fails; past 7 days it expires", async () => {
     const env = await setup();
     failNext = "Calls to this api have exceeded the rate limit.";

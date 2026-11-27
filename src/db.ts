@@ -1,3 +1,5 @@
+import { midKey } from "./meta";
+
 export interface Lead {
   subscriber_id: string;
   username: string | null;
@@ -81,14 +83,19 @@ export async function recordInbound(
     .first<{ id: number; mid: string | null }>();
   if (dup && (!m.mid || !dup.mid)) {
     await db.batch([
-      db.prepare(`UPDATE messages SET mid = COALESCE(mid, ?2) WHERE id = ?1`).bind(dup.id, m.mid ?? null),
+      db.prepare(`UPDATE messages SET mid = COALESCE(mid, ?2), mkey = COALESCE(mkey, ?3) WHERE id = ?1`).bind(dup.id, m.mid ?? null, midKey(m.mid)),
       db.prepare(`UPDATE leads SET mc_id = COALESCE(?2, mc_id) WHERE subscriber_id = ?1`).bind(m.subscriber_id, m.mc_id ?? null),
     ]);
     return false;
   }
+  // The key too, and not when it's already there: while an install moves between logins the same message can come
+  // from both apps, under two ids (src/meta.ts midKey).
   const ins = await db
-    .prepare(`INSERT OR IGNORE INTO messages (subscriber_id, role, text, created_at, mid, flow_pending) VALUES (?1, 'lead', ?2, ?3, ?4, ?5)`)
-    .bind(m.subscriber_id, m.text, now, m.mid ?? null, m.pending ?? null)
+    .prepare(
+      `INSERT OR IGNORE INTO messages (subscriber_id, role, text, created_at, mid, flow_pending, mkey) SELECT ?1, 'lead', ?2, ?3, ?4, ?5, ?6
+       WHERE ?6 IS NULL OR NOT EXISTS (SELECT 1 FROM messages WHERE mkey = ?6)`,
+    )
+    .bind(m.subscriber_id, m.text, now, m.mid ?? null, m.pending ?? null, midKey(m.mid))
     .run();
   if (!ins.meta.changes) return false;
   await db.batch([
@@ -120,11 +127,18 @@ export async function recordEcho(db: D1Database, subscriberId: string, text: str
   const [claimed, ins] = await db.batch([
     db
       .prepare(
-        `UPDATE messages SET mid = ?3 WHERE id = (SELECT id FROM messages WHERE subscriber_id = ?1 AND role = 'bot' AND +mid IS NULL AND text = ?2
-           AND created_at > ?4 ORDER BY id LIMIT 1) AND NOT EXISTS (SELECT 1 FROM messages WHERE mid = ?3) RETURNING id`,
+        `UPDATE messages SET mid = ?3, mkey = ?5 WHERE id = (SELECT id FROM messages WHERE subscriber_id = ?1 AND role = 'bot' AND +mid IS NULL AND text = ?2
+           AND created_at > ?4 ORDER BY id LIMIT 1) AND NOT EXISTS (SELECT 1 FROM messages WHERE mid = ?3)
+           AND NOT EXISTS (SELECT 1 FROM messages WHERE mkey = ?5) RETURNING id`,
       )
-      .bind(subscriberId, text, mid, now - 10 * 60 * 1000),
-    db.prepare(`INSERT OR IGNORE INTO messages (subscriber_id, role, text, created_at, mid) VALUES (?1, 'bot', ?2, ?3, ?4) RETURNING id`).bind(subscriberId, text, now, mid),
+      .bind(subscriberId, text, mid, now - 10 * 60 * 1000, midKey(mid)),
+    // Our own send's echo under the other login's id (a send that began just before a switch) is ours too.
+    db
+      .prepare(
+        `INSERT OR IGNORE INTO messages (subscriber_id, role, text, created_at, mid, mkey) SELECT ?1, 'bot', ?2, ?3, ?4, ?5
+         WHERE ?5 IS NULL OR NOT EXISTS (SELECT 1 FROM messages WHERE mkey = ?5) RETURNING id`,
+      )
+      .bind(subscriberId, text, now, mid, midKey(mid)),
   ]);
   if (claimed.results.length || !ins.results.length) return false; // our own send, already recorded
   await db.batch([
@@ -141,6 +155,31 @@ export async function getSetting(db: D1Database, key: string): Promise<string | 
 
 export async function setSetting(db: D1Database, key: string, value: string): Promise<void> {
   await db.prepare(`INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = excluded.value`).bind(key, value).run();
+}
+
+// messages.mkey (migrations/mkey.sql) for every message with an id, a batch a minute from a watermark: the history
+// once (about 160 batches), then whatever arrived since. One UPDATE per batch, by primary key.
+export async function fillMessageKeys(db: D1Database): Promise<number> {
+  const from = Number((await getSetting(db, "mkey_id")) ?? 0);
+  const { results } = await db.prepare(`SELECT id, mid FROM messages WHERE id > ?1 ORDER BY id LIMIT 1000`).bind(from).all<{ id: number; mid: string | null }>();
+  if (!results.length) return 0;
+  const rows = results.flatMap((r) => {
+    const k = midKey(r.mid);
+    return k ? [{ i: r.id, k }] : [];
+  });
+  await db.batch([
+    ...(rows.length
+      ? [
+          db
+            .prepare(
+              `UPDATE messages SET mkey = j.k FROM (SELECT json_extract(value, '$.i') AS i, json_extract(value, '$.k') AS k FROM json_each(?1)) AS j WHERE messages.id = j.i`,
+            )
+            .bind(JSON.stringify(rows)),
+        ]
+      : []),
+    db.prepare(`INSERT INTO settings (key, value) VALUES ('mkey_id', ?1) ON CONFLICT (key) DO UPDATE SET value = excluded.value`).bind(String(results[results.length - 1].id)),
+  ]);
+  return rows.length;
 }
 
 // SQL: lead `l` spoke last. Our bubbles after their last message answer it, except a handoff's hold-on line ("lemme

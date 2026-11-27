@@ -3,8 +3,9 @@
 // Two logins reach the same API. Instagram Login (business login; apps set up before Meta closed it to new apps in late
 // October 2026): graph.instagram.com, and the account is "me". Unified login (every app created since, switched on by
 // META_LOGIN_CONFIG_ID): a Facebook Login for Business configuration hands out a business system-user token that only
-// works on graph.facebook.com, with the account's own id in place of "me". Same paths otherwise, so every call goes
-// through graph() and useLogin() says which one this install runs.
+// works on graph.facebook.com, with the account's own id in place of "me". Same paths otherwise. Every call goes through
+// graph(), which goes by the token it carries: so moving an install from one login to the other is one moment, storing
+// the new token, and a request already running on the old one finishes on it.
 
 import type { MessageUpdate, Part } from "./attachments";
 
@@ -12,12 +13,41 @@ const IG_GRAPH = "https://graph.instagram.com/v26.0";
 const FB_GRAPH = "https://graph.facebook.com/v26.0";
 export const SCOPES = "instagram_business_basic,instagram_business_manage_messages,instagram_business_manage_comments";
 
-// One account per install, so this is per install: every entry point sets it (src/index.ts) before any call.
-let api = { base: IG_GRAPH, me: "me" };
-export function useLogin(unified: boolean, accountId: string | null): void {
-  api = unified ? { base: FB_GRAPH, me: accountId ?? "me" } : { base: IG_GRAPH, me: "me" };
+// Unified login's tokens are Facebook ones ("EAA..."); Instagram Login's start "IG". Checked on both live tokens 2026-11-27.
+export const unifiedToken = (token: string | null | undefined): boolean => Boolean(token?.startsWith("EAA"));
+
+// The account's own id, which a Unified login token uses in place of "me" (the same id under both logins). One account
+// per install: every entry point sets it (src/index.ts) before any call.
+let account: string | null = null;
+export function useAccount(id: string | null): void {
+  account = id;
 }
-export const unifiedLogin = () => api.base === FB_GRAPH;
+
+// A message id's "<account>:<thread>:<item>". The two logins give the same message different ids (Instagram Login's
+// decode to "ig_d...", Unified login's to "new_ig_dm_..."), but both carry these three numbers in their base64, at an
+// offset. So this is what finds a message by an id from either (messages.mkey). Null for anything else ("pb:" taps,
+// test ids). Checked 2026-11-27 on @yourhandle's threads: 5 of 5 the same through both logins.
+export function midKey(mid: string | null | undefined): string | null {
+  if (!mid || mid.includes(":")) return null;
+  const s = mid.replace(/-/g, "+").replace(/_/g, "/").replace(/=+$/, "");
+  for (let k = 0; k < 4; k++) {
+    // Pad the last group rather than drop it: the item number can run to the very end.
+    const part = s.slice(k);
+    const r = part.length % 4;
+    try {
+      const t = atob(r === 1 ? part.slice(0, -1) : part + "=".repeat((4 - r) % 4)).match(/\d{10,}:\d{25,}:\d{10,}/);
+      if (t) return t[0];
+    } catch {
+      // not base64 at this offset
+    }
+  }
+  return null;
+}
+
+// A message id from the other login than the token's (from before a switch, or after a rollback): Instagram can't take
+// it back (reading an Instagram Login id with a Unified token answers code 1), so a reaction or a reply quote that names
+// it can't be sent. Instagram Login ids are base64 of "ig_d...", Unified login's of "new_ig_dm_...".
+export const otherLoginMid = (mid: string, token: string | null | undefined) => mid.startsWith(unifiedToken(token) ? "aWdfZA" : "bmV3X2lnX2RtX");
 
 export async function hmacHex(secret: string, body: string): Promise<string> {
   const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
@@ -283,9 +313,12 @@ export function parseComments(payload: unknown): MetaComment[] {
 }
 
 export async function graph<T>(path: string, init?: RequestInit): Promise<T> {
-  // Paging links come back as full URLs on either host; "/me" is the account under Unified login.
-  const rel = path.replace(/^https:\/\/graph\.(instagram|facebook)\.com\/v[\d.]+/, "").replace(/^\/me(?=[/?]|$)/, `/${api.me}`);
-  const res = await fetch(`${api.base}${rel}`, init);
+  // The host follows the call's own token (the Authorization header, or access_token in the query); paging links come
+  // back as full URLs on either host; "/me" is the account under Unified login.
+  const token = new Headers(init?.headers).get("Authorization")?.replace(/^Bearer /, "") ?? new URL(path, "https://x").searchParams.get("access_token");
+  const unified = unifiedToken(token);
+  const rel = path.replace(/^https:\/\/graph\.(instagram|facebook)\.com\/v[\d.]+/, "").replace(/^\/me(?=[/?]|$)/, unified && account ? `/${account}` : "/me");
+  const res = await fetch(`${unified ? FB_GRAPH : IG_GRAPH}${rel}`, init);
   const body = (await res.json().catch(() => ({}))) as T & { error?: { message?: string; code?: number } };
   if (!res.ok || body.error) throw new Error(`instagram ${res.status}${body.error?.code ? ` code ${body.error.code}` : ""}: ${body.error?.message ?? "request failed"}`);
   return body;
@@ -296,7 +329,7 @@ export async function sendText(token: string, leadId: string, text: string, repl
   const body = await graph<{ message_id: string }>("/me/messages", {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ recipient: { id: leadId }, message: { text }, ...(replyTo ? { reply_to: { mid: replyTo } } : {}) }),
+    body: JSON.stringify({ recipient: { id: leadId }, message: { text }, ...(replyTo && !otherLoginMid(replyTo, token) ? { reply_to: { mid: replyTo } } : {}) }),
   });
   return body.message_id;
 }
@@ -312,6 +345,7 @@ export async function senderAction(token: string, leadId: string, action: "mark_
 
 // React to a message with any emoji, or take our reaction off (emoji null).
 export async function react(token: string, leadId: string, mid: string, emoji: string | null): Promise<void> {
+  if (otherLoginMid(mid, token)) throw new Error("Instagram can't react to a message from the other login (before a switch, or after going back)");
   await graph("/me/messages", {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
@@ -430,6 +464,20 @@ export async function refreshToken(token: string): Promise<string> {
 
 export async function subscribe(token: string): Promise<void> {
   await graph(`/me/subscribed_apps?${new URLSearchParams({ subscribed_fields: "messages,messaging_postbacks,messaging_seen,comments,live_comments", access_token: token })}`, { method: "POST" });
+}
+
+// The other login's subscription, once the account has moved: its app stops delivering (until then src/index.ts ignores it).
+export async function unsubscribe(token: string): Promise<void> {
+  await graph(`/me/subscribed_apps?${new URLSearchParams({ access_token: token })}`, { method: "DELETE" });
+}
+
+// Unified login: was the Facebook Page the account is linked to shared at login? Without it Meta delivers comments but
+// not DMs. The system user's own /me, not the account's (checked on a live token 2026-11-27: each Page with its
+// instagram_business_account).
+export async function pageShared(token: string, accountId: string): Promise<boolean> {
+  const r = await fetch(`${FB_GRAPH}/me/assigned_pages?fields=instagram_business_account&limit=100`, { headers: { Authorization: `Bearer ${token}` } });
+  const body = (await r.json().catch(() => ({}))) as { data?: { instagram_business_account?: { id?: string } }[] };
+  return (body.data ?? []).some((p) => p.instagram_business_account?.id === accountId);
 }
 
 // Instagram sends a heart as a bare "❤" (U+2764), which browsers draw as a white text glyph. One pictograph without the

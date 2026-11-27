@@ -12,7 +12,7 @@ import { customerLine } from "./roster";
 import { ping } from "./live";
 import { enrichPending } from "./media";
 import { findByIgId, sendBubbles } from "./manychat";
-import { react, refreshToken, senderAction, sendText, unifiedLogin } from "./meta";
+import { midKey, otherLoginMid, react, refreshToken, senderAction, sendText, unifiedToken } from "./meta";
 import { meter } from "./usage";
 
 export interface Env {
@@ -31,6 +31,8 @@ export interface Env {
   META_IG_APP_ID: string; // Unified login: the Meta app's own id
   META_APP_SECRET: string; // Instagram app secret (API setup with Instagram login); Unified login: the Meta app secret
   META_LOGIN_CONFIG_ID?: string; // set = Unified login (src/meta.ts): the Facebook Login for Business configuration id
+  META_UNIFIED_APP_ID?: string; // only on an install moving from Instagram Login: the Unified login app (META_IG_APP_ID stays the Instagram app)
+  META_UNIFIED_APP_SECRET?: string; // ...and its secret, which signs its webhooks (META_APP_SECRET stays the Instagram app secret)
   META_VERIFY_TOKEN: string;
   SKOOL_AUTH_TOKEN?: string;
   ALERT_TOPIC?: string; // ntfy.sh topic for phone alerts (src/health.ts) // The owner's Skool auth_token cookie (one-year JWT): reads new members for join matching
@@ -243,13 +245,13 @@ export async function sendDraft(env: Env, draft: db.Draft, now: number, edited?:
         ),
         env.DB.prepare(`UPDATE drafts SET status = ?2, bubbles = ?3 WHERE id = ?1`).bind(draft.id, said.length ? "sent" : "superseded", JSON.stringify(said)),
       ]);
-      if (opts.replyTo && mids[0]) await saveReplyTo(env.DB, mids[0], opts.replyTo);
+      if (opts.replyTo && mids[0] && !otherLoginMid(opts.replyTo, await db.getSetting(env.DB, "ig_token"))) await saveReplyTo(env.DB, mids[0], opts.replyTo);
       await clearOutgoing(env.DB, lead.subscriber_id, now);
       return;
     }
     await env.DB.batch(out.map((text, i) => recordSent(env, draft.subscriber_id, text, now, mids[i])));
     // The first bubble went out quoting their message (deliver passes replyTo on it only); the echo may say so too.
-    if (opts.replyTo && mids[0]) await saveReplyTo(env.DB, mids[0], opts.replyTo);
+    if (opts.replyTo && mids[0] && !otherLoginMid(opts.replyTo, await db.getSetting(env.DB, "ig_token"))) await saveReplyTo(env.DB, mids[0], opts.replyTo);
     await clearOutgoing(env.DB, lead.subscriber_id, now);
   }
   if (draft.action === "react") {
@@ -270,20 +272,22 @@ export async function sendDraft(env: Env, draft: db.Draft, now: number, edited?:
   else if (bubbles.length && (draft.action === "reply" || draft.action === "follow_up")) await scheduleFollowUp(env.DB, lead, draft, now);
 }
 
-// A bubble we sent. The echo webhook can land before this insert: with a mid, OR IGNORE drops the copy; without one
-// (Manychat sends), skip it when an echo of the same text already arrived since the send began.
+// A bubble we sent. The echo webhook can land before this insert: with a mid, OR IGNORE drops the copy (and the key
+// check drops the echo's copy under the other login's id, around a switch); without one (Manychat sends), skip it when an
+// echo of the same text already arrived since the send began.
 function recordSent(env: Env, leadId: string, text: string, now: number, mid: string | null): D1PreparedStatement {
   return env.DB.prepare(
-    `INSERT OR IGNORE INTO messages (subscriber_id, role, text, created_at, mid) SELECT ?1, 'bot', ?2, ?3, ?4
-     WHERE ?4 IS NOT NULL OR NOT EXISTS (SELECT 1 FROM messages WHERE subscriber_id = ?1 AND role = 'bot' AND text = ?2 AND mid IS NOT NULL AND created_at >= ?3)`,
-  ).bind(leadId, text, now, mid);
+    `INSERT OR IGNORE INTO messages (subscriber_id, role, text, created_at, mid, mkey) SELECT ?1, 'bot', ?2, ?3, ?4, ?5
+     WHERE (?4 IS NOT NULL OR NOT EXISTS (SELECT 1 FROM messages WHERE subscriber_id = ?1 AND role = 'bot' AND text = ?2 AND mid IS NOT NULL AND created_at >= ?3))
+       AND (?5 IS NULL OR NOT EXISTS (SELECT 1 FROM messages WHERE mkey = ?5))`,
+  ).bind(leadId, text, now, mid, midKey(mid));
 }
 
 // ❤️ on one of their messages, through Instagram (Manychat's API can't react, so a Manychat-routed lead gets nothing).
 async function heart(env: Env, lead: db.Lead, messageId: number): Promise<void> {
   const row = await env.DB.prepare(`SELECT mid, reactions FROM messages WHERE id = ?1`).bind(messageId).first<{ mid: string | null; reactions: string | null }>();
   const token = await db.getSetting(env.DB, "ig_token");
-  if (!row?.mid || !token || lead.mc_id || env.TRANSPORT !== "meta") return;
+  if (!row?.mid || !token || lead.mc_id || env.TRANSPORT !== "meta" || otherLoginMid(row.mid, token)) return;
   await react(token, lead.subscriber_id, row.mid, "❤️");
   const rx = { ...(JSON.parse(row.reactions ?? "{}") as object), you: "❤️" };
   await env.DB.prepare(`UPDATE messages SET reactions = ?2 WHERE id = ?1`).bind(messageId, JSON.stringify(rx)).run();
@@ -293,7 +297,7 @@ async function heart(env: Env, lead: db.Lead, messageId: number): Promise<void> 
 async function keepTokenFresh(env: Env, now: number): Promise<void> {
   const token = await db.getSetting(env.DB, "ig_token");
   const at = Number((await db.getSetting(env.DB, "ig_token_at")) ?? 0);
-  if (!token || now - at < TOKEN_REFRESH_MS || unifiedLogin()) return; // a Unified login token can't be refreshed
+  if (!token || now - at < TOKEN_REFRESH_MS || unifiedToken(token)) return; // a Unified login token can't be refreshed
   await db.setSetting(env.DB, "ig_token", await refreshToken(token));
   await db.setSetting(env.DB, "ig_token_at", String(now));
 }

@@ -8,7 +8,7 @@
 
 import { MSG_FIELDS, partsFromApi, saveParts, type ApiMessageDetail, type Part } from "./attachments";
 import * as db from "./db";
-import { fetchProfile, graph } from "./meta";
+import { fetchProfile, graph, midKey } from "./meta";
 import { saveProfile } from "./profiles";
 import type { Env } from "./setter";
 
@@ -112,7 +112,9 @@ async function syncThread(env: Env, token: string, other: { id: string; username
   for (const m of sorted) {
     const at = Date.parse(m.created_time);
     if (at <= after) continue; // only the missing tail
-    const known = await env.DB.prepare(`SELECT 1 FROM messages WHERE mid = ?1`).bind(m.id).first();
+    // Either login's id: a bubble is stored with the draft's start time, so after a switch the listing's copy (sent
+    // seconds later, under the new id) is newer than last_at and would go in twice.
+    const known = await env.DB.prepare(`SELECT 1 FROM messages WHERE mid = ?1 OR mkey = ?2`).bind(m.id, midKey(m.id)).first();
     if (known) continue;
     const text = syncText(m);
     if (m.from?.id === me) {
@@ -134,10 +136,11 @@ async function syncThread(env: Env, token: string, other: { id: string; username
 }
 
 // A group's id from its conversation id ("aWdfZAG06" + the thread id in base64), the same thread id every message id
-// carries. Anything else shaped: the conversation id itself.
+// carries. Shaped otherwise (Unified login's conversation ids weren't checked): the thread id from one of its message
+// ids, then the conversation id itself.
 const CONV_PREFIX = "aWdfZAG06";
-export function groupId(conversationId: string): string {
-  let thread = conversationId;
+export function groupId(conversationId: string, mid?: string): string {
+  let thread = midKey(mid)?.split(":")[1] ?? conversationId;
   try {
     const t = atob(conversationId.slice(CONV_PREFIX.length));
     if (conversationId.startsWith(CONV_PREFIX) && /^\d+$/.test(t)) thread = t;
@@ -151,7 +154,7 @@ export function groupId(conversationId: string): string {
 // AI (no last_inbound_at, no pauses, no drafts). A message already filed under one member as their DMs (the webhook,
 // or the history import before 2026-11-01) moves into the group.
 async function syncGroup(env: Env, c: ApiConversation, members: { id: string; username?: string }[], me: string): Promise<number> {
-  const id = groupId(c.id);
+  const id = groupId(c.id, c.messages?.data?.[0]?.id);
   const msgs = [...(c.messages?.data ?? [])].sort((a, b) => Date.parse(a.created_time) - Date.parse(b.created_time));
   await env.DB.prepare(
     `INSERT INTO leads (subscriber_id, members, created_at) VALUES (?1, ?2, ?3) ON CONFLICT (subscriber_id) DO UPDATE SET members = excluded.members`,
@@ -164,18 +167,18 @@ async function syncGroup(env: Env, c: ApiConversation, members: { id: string; us
   for (const m of msgs) {
     const sender = m.from?.id && m.from.id !== me ? m.from.id : null;
     const role = sender ? "lead" : "bot";
-    const known = await env.DB.prepare(`SELECT subscriber_id FROM messages WHERE mid = ?1`).bind(m.id).first<{ subscriber_id: string }>();
+    const known = await env.DB.prepare(`SELECT id, subscriber_id FROM messages WHERE mid = ?1 OR mkey = ?2`).bind(m.id, midKey(m.id)).first<{ id: number; subscriber_id: string }>();
     if (known) {
       if (known.subscriber_id !== id) {
-        await env.DB.prepare(`UPDATE messages SET subscriber_id = ?2, role = ?3, sender = ?4 WHERE mid = ?1`).bind(m.id, id, role, sender).run();
+        await env.DB.prepare(`UPDATE messages SET subscriber_id = ?2, role = ?3, sender = ?4 WHERE id = ?1`).bind(known.id, id, role, sender).run();
         moved.add(known.subscriber_id);
       }
       continue;
     }
     const at = Date.parse(m.created_time);
     if (at <= after) continue; // only the missing tail
-    await env.DB.prepare(`INSERT OR IGNORE INTO messages (subscriber_id, role, text, created_at, mid, sender) VALUES (?1, ?2, ?3, ?4, ?5, ?6)`)
-      .bind(id, role, syncText(m), at, m.id, sender)
+    await env.DB.prepare(`INSERT OR IGNORE INTO messages (subscriber_id, role, text, created_at, mid, sender, mkey) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`)
+      .bind(id, role, syncText(m), at, m.id, sender, midKey(m.id))
       .run();
     await saveParts(env.DB, m.id, partsFromApi(m).filter((p) => p.type !== "unsupported" || !m.message));
     added++;

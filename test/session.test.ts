@@ -3,7 +3,7 @@ import { makeD1 } from "./d1shim";
 import * as db from "../src/db";
 import worker from "../src/index";
 import { hasSession, sessionCookie } from "../src/session";
-import { graph, useLogin } from "../src/meta";
+import { graph, hmacHex, useAccount } from "../src/meta";
 import type { Env } from "../src/setter";
 
 const OWNER = "17840000000000001";
@@ -191,13 +191,13 @@ describe("Unified login (Meta apps created since late October 2026)", () => {
       "fetch",
       vi.fn(async (url: string) => {
         calls.push(url);
-        if (url.includes("graph.facebook.com/v26.0/oauth/access_token")) return Response.json({ access_token: "suat" });
+        if (url.includes("graph.facebook.com/v26.0/oauth/access_token")) return Response.json({ access_token: "EAAsuat" });
         if (url.includes("graph.facebook.com/v26.0/me/assigned_instagram_accounts")) return Response.json({ data: accounts });
         return Response.json({});
       }),
     );
   });
-  afterEach(() => useLogin(false, null));
+  afterEach(() => useAccount(null));
 
   it("logs in through the configuration, claims the account it was set up for, and calls graph.facebook.com with its id", async () => {
     const env = unifiedEnv();
@@ -212,7 +212,7 @@ describe("Unified login (Meta apps created since late October 2026)", () => {
     expect(res.status).toBe(303);
     expect(await hasSession(withCookie("/admin/dashboard", cookieOf(res)), env)).toBe(true);
     expect(await db.getSetting(env.DB, "ig_account_id")).toBe(ACCT);
-    expect(await db.getSetting(env.DB, "ig_token")).toBe("suat");
+    expect(await db.getSetting(env.DB, "ig_token")).toBe("EAAsuat");
     expect(calls.some((u) => u.startsWith(`https://graph.facebook.com/v26.0/${ACCT}/subscribed_apps?`))).toBe(true);
     expect(calls.some((u) => u.includes("graph.instagram.com") || u.includes("api.instagram.com"))).toBe(false);
 
@@ -246,18 +246,21 @@ describe("Unified login (Meta apps created since late October 2026)", () => {
 });
 
 describe("graph()", () => {
-  afterEach(() => useLogin(false, null));
-  it("rewrites /me and paging links for Unified login, and leaves Instagram Login as it was", async () => {
+  afterEach(() => useAccount(null));
+  it("goes by the call's own token: Unified login's to graph.facebook.com with the account id for /me, Instagram Login's as before", async () => {
     const seen: string[] = [];
     vi.stubGlobal("fetch", vi.fn(async (url: string) => (seen.push(url), Response.json({ ok: true }))));
-    await graph("/me/messages", { method: "POST" });
-    await graph("/me?fields=user_id");
-    useLogin(true, "1784");
-    await graph("/me/messages", { method: "POST" });
-    await graph("/me?fields=username");
-    await graph("/media123/comments?limit=50");
-    await graph("https://graph.facebook.com/v26.0/1784/conversations?after=abc");
-    await graph("/messenger_profile_x"); // only "/me" itself is the account, not anything that starts with it
+    useAccount("1784");
+    const ig = { headers: { Authorization: "Bearer IGAAold" } };
+    const fb = { headers: { Authorization: "Bearer EAAnew" } };
+    await graph("/me/messages", { method: "POST", ...ig });
+    await graph("/me?fields=user_id", ig);
+    await graph("/me/messages", { method: "POST", ...fb });
+    await graph("/me?fields=username", fb);
+    await graph("/media123/comments?limit=50", fb);
+    await graph("https://graph.facebook.com/v26.0/1784/conversations?after=abc", fb);
+    await graph("/messenger_profile_x", fb); // only "/me" itself is the account, not anything that starts with it
+    await graph("/me/subscribed_apps?access_token=EAAnew", { method: "POST" }); // a token in the query counts too
     expect(seen).toEqual([
       "https://graph.instagram.com/v26.0/me/messages",
       "https://graph.instagram.com/v26.0/me?fields=user_id",
@@ -266,6 +269,125 @@ describe("graph()", () => {
       "https://graph.facebook.com/v26.0/media123/comments?limit=50",
       "https://graph.facebook.com/v26.0/1784/conversations?after=abc",
       "https://graph.facebook.com/v26.0/messenger_profile_x",
+      "https://graph.facebook.com/v26.0/1784/subscribed_apps?access_token=EAAnew",
     ]);
+  });
+});
+
+describe("moving a live install from Instagram Login to Unified login, with no gap", () => {
+  // Instagram Login's app stays in META_IG_APP_ID / META_APP_SECRET ("appsecret"); the Unified one is named beside it.
+  const LIVE = { META_LOGIN_CONFIG_ID: "cfg42", META_UNIFIED_APP_ID: "1571", META_UNIFIED_APP_SECRET: "fbsecret" };
+  const admin = (path: string) => new Request(`https://x${path}`, { headers: { Authorization: `Basic ${btoa("j:pw")}` } });
+  let log: string[] = [];
+  let next = "EAAnew";
+  let pages: { instagram_business_account?: { id: string } }[] = [];
+  beforeEach(() => {
+    log = [];
+    pages = [{ instagram_business_account: { id: OWNER } }];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        log.push(`${init?.method ?? "GET"} ${url}`);
+        if (url.includes("graph.facebook.com/v26.0/oauth/access_token")) return Response.json({ access_token: next });
+        if (url.includes("/me/assigned_instagram_accounts")) return Response.json({ data: [{ id: OWNER }] });
+        if (url.includes("/me/assigned_pages")) return Response.json({ data: pages });
+        if (url.includes("api.instagram.com/oauth/access_token")) return Response.json({ access_token: "short", user_id: 33900000000000001 });
+        if (url.includes("graph.instagram.com/access_token")) return Response.json({ access_token: next });
+        if (url.includes("/me?fields=user_id")) return Response.json({ user_id: OWNER });
+        return Response.json({});
+      }),
+    );
+  });
+  afterEach(() => useAccount(null));
+
+  async function live() {
+    const env = { ...makeEnv(), ...LIVE };
+    await db.setSetting(env.DB, "ig_account_id", OWNER);
+    await db.setSetting(env.DB, "ig_user_id", "33900000000000001");
+    await db.setSetting(env.DB, "ig_token", "IGAAold");
+    return env;
+  }
+  async function move(env: Env, path: string) {
+    const start = await worker.fetch(admin(path), env, ctx);
+    const to = new URL(start.headers.get("Location")!);
+    const state = to.searchParams.get("state");
+    const done = await worker.fetch(new Request(`https://x/auth/callback?code=abc&state=${state}`, { headers: { Cookie: cookieOf(start) } }), env, ctx);
+    return { to, done };
+  }
+  async function webhook(env: Env, secret: string, mid: string) {
+    const body = JSON.stringify({ object: "instagram", entry: [{ id: OWNER, messaging: [{ sender: { id: "555" }, recipient: { id: OWNER }, timestamp: 1, message: { mid, text: "hi" } }] }] });
+    const res = await worker.fetch(new Request("https://x/meta", { method: "POST", body, headers: { "X-Hub-Signature-256": `sha256=${await hmacHex(secret, body)}` } }), env, ctx);
+    return { status: res.status, stored: Boolean(await env.DB.prepare(`SELECT 1 FROM messages WHERE mid = ?1`).bind(mid).first()) };
+  }
+
+  it("console sign-ins keep the login in use; /auth/start is the move", async () => {
+    const env = await live();
+    expect((await worker.fetch(new Request("https://x/auth/login"), env, ctx)).headers.get("Location")).toContain("https://www.instagram.com/oauth/authorize?");
+    const to = new URL((await worker.fetch(admin("/auth/start"), env, ctx)).headers.get("Location")!);
+    expect(to.origin + to.pathname).toBe("https://www.facebook.com/dialog/oauth");
+    expect(to.searchParams.get("client_id")).toBe("1571");
+  });
+
+  it("only the app whose token is in use counts, before and after the switch", async () => {
+    const env = await live();
+    expect(await webhook(env, "fbsecret", "u1")).toEqual({ status: 200, stored: false }); // new app, not in use yet
+    expect(await webhook(env, "appsecret", "i1")).toEqual({ status: 200, stored: true });
+    expect((await webhook(env, "nobody", "x1")).status).toBe(401);
+    await db.setSetting(env.DB, "ig_token", "EAAnew");
+    expect(await webhook(env, "appsecret", "i2")).toEqual({ status: 200, stored: false }); // old app, moved off
+    expect(await webhook(env, "fbsecret", "u2")).toEqual({ status: 200, stored: true });
+  });
+
+  it("subscribes the new app before the switch, stops the old one after, and goes back the same way", async () => {
+    const env = await live();
+    const { done } = await move(env, "/auth/start");
+    expect(done.status).toBe(303);
+    expect(await db.getSetting(env.DB, "ig_token")).toBe("EAAnew");
+    expect(await db.getSetting(env.DB, "ig_token_previous")).toBe("IGAAold");
+    const sub = log.indexOf(`POST https://graph.facebook.com/v26.0/${OWNER}/subscribed_apps?subscribed_fields=messages%2Cmessaging_postbacks%2Cmessaging_seen%2Ccomments%2Clive_comments&access_token=EAAnew`);
+    const unsub = log.indexOf("DELETE https://graph.instagram.com/v26.0/me/subscribed_apps?access_token=IGAAold");
+    expect(sub).toBeGreaterThan(-1);
+    expect(unsub).toBeGreaterThan(sub);
+    expect(log.some((l) => l.includes("client_id=1571") && l.includes("client_secret=fbsecret"))).toBe(true);
+
+    log = [];
+    next = "IGAAback";
+    const back = await move(env, "/auth/start?login=instagram");
+    expect(back.to.origin).toBe("https://www.instagram.com");
+    expect(await db.getSetting(env.DB, "ig_token")).toBe("IGAAback");
+    expect(log.some((l) => l.startsWith(`DELETE https://graph.facebook.com/v26.0/${OWNER}/subscribed_apps?access_token=EAAnew`))).toBe(true);
+    next = "EAAnew";
+  });
+
+  it("refuses the move when the Page the account is linked to wasn't shared: nothing changes", async () => {
+    const env = await live();
+    pages = [{ instagram_business_account: { id: "17841400000000009" } }];
+    const { done } = await move(env, "/auth/start");
+    expect(await done.text()).toContain("Nothing moved");
+    expect(await db.getSetting(env.DB, "ig_token")).toBe("IGAAold");
+    expect(log.some((l) => l.includes("subscribed_apps"))).toBe(false);
+  });
+
+  it("the old app's deauthorize only drops the old token, never the one in use", async () => {
+    const env = await live();
+    await db.setSetting(env.DB, "ig_token", "EAAnew");
+    await db.setSetting(env.DB, "ig_token_previous", "IGAAold");
+    const deauth = async (secret: string) => {
+      const payload = Buffer.from(JSON.stringify({ user_id: "42" })).toString("base64url");
+      const sig = Buffer.from(await hmacHex(secret, payload), "hex").toString("base64url");
+      const body = new URLSearchParams({ signed_request: `${sig}.${payload}` });
+      return (await worker.fetch(new Request("https://x/deauthorize", { method: "POST", body }), env, ctx)).status;
+    };
+    expect(await deauth("appsecret")).toBe(200); // the Instagram Login app, moved off
+    expect(await db.getSetting(env.DB, "ig_token")).toBe("EAAnew");
+    expect(await db.getSetting(env.DB, "ig_token_previous")).toBeNull();
+    expect(await deauth("fbsecret")).toBe(200); // the app in use
+    expect(await db.getSetting(env.DB, "ig_token")).toBeNull();
+  });
+
+  it("one secret for both (a fresh Unified install that names it twice) still handles every webhook", async () => {
+    const env = { ...(await live()), META_APP_SECRET: "same", META_UNIFIED_APP_SECRET: "same" };
+    await db.setSetting(env.DB, "ig_token", "EAAnew");
+    expect(await webhook(env, "same", "s1")).toEqual({ status: 200, stored: true });
   });
 });

@@ -9,11 +9,11 @@ import { runBroadcasts } from "./broadcast";
 import { checkHealth, cronStep, logError, webhookSeen } from "./health";
 import { flowsAdminPost, flowsPage } from "./admin_flows";
 import { consoleRoute } from "./dashboard";
-import { getLead, getSetting, recordInbound, setSetting } from "./db";
+import { fillMessageKeys, getLead, getSetting, recordInbound, setSetting } from "./db";
 import { flowClick, flowSignals, handlePostback, handleRead, inboundFlow, parsePostbacks, parseReads, pendingFlow, resumeInbound, runDueFlows } from "./flows";
 import { handleClick } from "./links";
 import { getSubscriber, parseInbound } from "./manychat";
-import { authorizeUrl, exchangeCode, exchangeUnified, graph, fetchProfile, parseComments, parseMessageUpdates, parseParts, parseReplies, parseSignedRequest, parseWebhook, subscribe, useLogin, verifySignature } from "./meta";
+import { authorizeUrl, exchangeCode, exchangeUnified, graph, fetchProfile, parseComments, parseMessageUpdates, parseParts, parseReplies, parseSignedRequest, parseWebhook, pageShared, subscribe, unifiedToken, unsubscribe, useAccount, verifySignature } from "./meta";
 import { applyUpdate, mediaRoute, saveParts, saveReplyTo } from "./attachments";
 import { legalPage } from "./pages";
 import { saveProfile } from "./profiles";
@@ -37,11 +37,15 @@ async function handleMeta(req: Request, env: Env, ctx: ExecutionContext): Promis
     return ok ? new Response(url.searchParams.get("hub.challenge") ?? "") : new Response("forbidden", { status: 403 });
   }
   const raw = await req.text();
-  if (!(await verifySignature(env.META_APP_SECRET, raw, req.headers.get("X-Hub-Signature-256")))) {
-    return new Response("bad signature", { status: 401 });
+  const signature = req.headers.get("X-Hub-Signature-256");
+  const token = await getSetting(env.DB, "ig_token");
+  // Signed by the app whose token is in use: handle it. An install moving between logins has both apps subscribed for
+  // a moment (no gap), so a valid signature from the other app is acknowledged and dropped: nothing runs twice.
+  if (!(await verifySignature(inUseSecret(env, token), raw, signature))) {
+    const other = env.META_UNIFIED_APP_SECRET && (await verifySignature(unifiedToken(token) ? env.META_APP_SECRET : env.META_UNIFIED_APP_SECRET, raw, signature));
+    return other ? new Response("ok (the other login)") : new Response("bad signature", { status: 401 });
   }
   await webhookSeen(env.DB, Date.now()); // so a silent webhook can be noticed (src/health.ts)
-  const token = await getSetting(env.DB, "ig_token");
   const payload = JSON.parse(raw);
   for (const c of parseComments(payload)) await handleComment(env.DB, token, env.SKOOL_LINK, c, Date.now());
   const signals = flowSignals(payload);
@@ -77,20 +81,28 @@ async function handleMeta(req: Request, env: Env, ctx: ExecutionContext): Promis
   return new Response("ok");
 }
 
-// Which login this install runs (src/meta.ts), set before anything calls Instagram. Instagram Login reads nothing for it.
+// The account id a Unified login token addresses in place of "me" (src/meta.ts), set before anything calls Instagram.
+// An install that never uses Unified login reads nothing for it.
 async function login(env: Env): Promise<void> {
-  useLogin(Boolean(env.META_LOGIN_CONFIG_ID), env.META_LOGIN_CONFIG_ID ? await getSetting(env.DB, "ig_account_id") : null);
+  useAccount(env.META_LOGIN_CONFIG_ID ? await getSetting(env.DB, "ig_account_id") : null);
 }
+
+// The Unified login app. A fresh install has one app (META_IG_APP_ID / META_APP_SECRET); an install moving over from
+// Instagram Login keeps its Instagram app there and names the Unified one in META_UNIFIED_APP_ID / _SECRET.
+const unifiedApp = (env: Env) => ({ id: env.META_UNIFIED_APP_ID || env.META_IG_APP_ID, secret: env.META_UNIFIED_APP_SECRET || env.META_APP_SECRET });
+// The secret of the app whose token is in use: it signs that app's webhooks and callbacks (no token yet: the install's own).
+const inUseSecret = (env: Env, token: string | null) => (unifiedToken(token) ? unifiedApp(env).secret : env.META_APP_SECRET);
 
 // Unified login: the login can grant several accounts and an install runs one, so take the one it already runs, else
 // the one it was set up for (brand.ts). A string is what to tell the person instead.
 async function pickUnified(env: Env, redirectUri: string, code: string): Promise<{ token: string; userId: string; me: { user_id: string; username?: string } } | string> {
-  const { token, accounts } = await exchangeUnified(env.META_IG_APP_ID, env.META_APP_SECRET, redirectUri, code);
+  const app = unifiedApp(env);
+  const { token, accounts } = await exchangeUnified(app.id, app.secret, redirectUri, code);
   if (!accounts.length) return "Meta didn't share an Instagram account with FewChat. Log in again and tick your account when Meta asks. If it never asks, the login configuration is missing business_management (MY-SETUP.md).";
   const owner = await getSetting(env.DB, "ig_account_id");
   const acct = accounts.find((a) => (owner ? a.id === owner : (a.username ?? "").toLowerCase() === IG_HANDLE.toLowerCase()));
   if (!acct) return owner ? "That Instagram account isn't the one this setter runs." : `This FewChat is set up for @${IG_HANDLE}. Log in again and pick that account.`;
-  useLogin(true, acct.id);
+  useAccount(acct.id);
   return { token, userId: acct.id, me: { user_id: acct.id, username: acct.username } };
 }
 
@@ -111,11 +123,19 @@ async function handleAuth(req: Request, env: Env, pathname: string): Promise<Res
     if (pathname === "/auth/start" && !(await role(req, env))) return Response.redirect(`${url.origin}/login`, 302);
     // A phone would bounce into Instagram's app at the consent screen: send it to the password form instead.
     if (pathname === "/auth/login" && isPhone(req)) return Response.redirect(`${url.origin}/login`, 302);
+    // Which login. Signing in to the console keeps the one in use, so it never moves the account by itself;
+    // /auth/start is the deliberate move: Unified login once it's configured, and ?login=instagram to go back.
+    let unified = Boolean(env.META_LOGIN_CONFIG_ID);
+    if (pathname === "/auth/login") {
+      const current = await getSetting(env.DB, "ig_token");
+      unified &&= !current || unifiedToken(current);
+    } else if (url.searchParams.get("login") === "instagram") unified = false;
     // The state lives in this browser's own short-lived cookie: two sign-ins (phone + laptop) never trip each other.
-    const state = `${pathname === "/auth/login" ? "login:" : ""}${crypto.randomUUID()}`;
+    const state = `${pathname === "/auth/login" ? "login:" : ""}${unified ? "u" : "i"}:${crypto.randomUUID()}`;
+    const appId = unified ? unifiedApp(env).id : env.META_IG_APP_ID;
     return new Response(null, {
       status: 302,
-      headers: { Location: authorizeUrl(env.META_IG_APP_ID, redirectUri, state, env.META_LOGIN_CONFIG_ID), "Set-Cookie": `${STATE_COOKIE}=${state}; Path=/auth; HttpOnly; Secure; SameSite=Lax; Max-Age=900` },
+      headers: { Location: authorizeUrl(appId, redirectUri, state, unified ? env.META_LOGIN_CONFIG_ID : undefined), "Set-Cookie": `${STATE_COOKIE}=${state}; Path=/auth; HttpOnly; Secure; SameSite=Lax; Max-Age=900` },
     });
   }
   // /auth/callback
@@ -127,8 +147,10 @@ async function handleAuth(req: Request, env: Env, pathname: string): Promise<Res
     return withCleared(loginPage(why, req));
   }
   const login = state.startsWith("login:");
+  const kind = state.replace(/^login:/, "").slice(0, 2); // "u:" / "i:"; a sign-in started before these existed: the config decides
+  const viaUnified = kind === "u:" || (kind !== "i:" && Boolean(env.META_LOGIN_CONFIG_ID));
   try {
-    const unified = env.META_LOGIN_CONFIG_ID ? await pickUnified(env, redirectUri, code.replace(/#_$/, "")) : null;
+    const unified = viaUnified ? await pickUnified(env, redirectUri, code.replace(/#_$/, "")) : null;
     if (typeof unified === "string") return withCleared(loginPage(unified, req));
     const { token, userId } = unified ?? (await exchangeCode(env.META_IG_APP_ID, env.META_APP_SECRET, redirectUri, code.replace(/#_$/, "")));
     if (login) {
@@ -148,22 +170,40 @@ async function handleAuth(req: Request, env: Env, pathname: string): Promise<Res
         // sees is enough and their DMs and comments start arriving.
         await setSetting(env.DB, "ig_account_id", who);
         await setSetting(env.DB, "ig_user_id", userId);
+        if (unified) useAccount(who); // again: another request in this isolate may have reset it before this one claimed
         await subscribe(token);
       }
       const ok = new Response(null, { status: 303, headers: { Location: `${url.origin}/admin/dashboard`, "Set-Cookie": await sessionCookie(env, Date.now()) } });
       return withCleared(ok);
     }
+    // Same account? Compared by the account id, which both logins share (ig_user_id is app-scoped under Instagram Login).
+    const owner = await getSetting(env.DB, "ig_account_id");
+    const account = unified ? unified.userId : owner ? (await graph<{ user_id: string }>(`/me?fields=user_id`, { headers: { Authorization: `Bearer ${token}` } })).user_id : null;
     const primary = await getSetting(env.DB, "ig_user_id");
-    if (primary && primary !== userId) {
+    if (owner ? account !== owner : primary && primary !== userId) {
       // A second account (Meta's App Review tester) is shown in /admin but never replaces the live one.
       await setSetting(env.DB, "review_ig_token", token);
       return Response.redirect(`${url.origin}/admin`, 303);
     }
+    // Moving between logins without a gap: the new app delivers first (ignored while the old token is in use), storing
+    // the token is the switch, then the old app stops. Anything already running finishes on the old token.
+    const previous = await getSetting(env.DB, "ig_token");
+    const moving = Boolean(previous && unifiedToken(previous) !== unifiedToken(token));
+    // Unified login only delivers DMs when the Page the account is linked to was shared (comments come either way), so a
+    // move without it would quietly leave DMs to the per-minute sync: refuse it, nothing changes.
+    if (moving && unified && !(await pageShared(token, unified.userId))) {
+      return withCleared(loginPage("Nothing moved: Meta didn't share the Facebook Page your Instagram is linked to, and without it your DMs wouldn't arrive. Open /auth/start again and pick that Page too.", req));
+    }
+    if (unified) useAccount(unified.userId);
+    await subscribe(token);
     await setSetting(env.DB, "ig_token", token);
     await setSetting(env.DB, "ig_token_at", String(Date.now()));
     await setSetting(env.DB, "ig_user_id", userId);
     if (unified) await setSetting(env.DB, "ig_account_id", userId); // every later request addresses the account by it
-    await subscribe(token);
+    if (moving) {
+      await setSetting(env.DB, "ig_token_previous", previous!); // what to go back to, with /auth/start
+      await unsubscribe(previous!).catch((e) => console.error("old login's subscription stays (its webhooks are ignored):", e));
+    }
   } catch (e) {
     console.error("instagram login/connect failed:", e);
     return withCleared(loginPage(`Instagram didn't finish the sign-in (${String(e).slice(0, 120)}). Try again.`, req));
@@ -174,9 +214,14 @@ async function handleAuth(req: Request, env: Env, pathname: string): Promise<Res
 // Meta calls these when the account removes the app or asks for its data to be deleted: drop the Instagram connection.
 async function handleRevoke(req: Request, env: Env, pathname: string): Promise<Response> {
   const form = await req.formData().catch(() => null);
-  const who = await parseSignedRequest(env.META_APP_SECRET, form ? String(form.get("signed_request") ?? "") : null);
-  if (!who) return new Response("bad signed_request", { status: 400 });
-  await env.DB.prepare(`DELETE FROM settings WHERE key IN ('ig_token', 'ig_token_at', 'ig_user_id')`).run();
+  const sr = form ? String(form.get("signed_request") ?? "") : null;
+  const token = await getSetting(env.DB, "ig_token");
+  const live = await parseSignedRequest(inUseSecret(env, token), sr);
+  // The other app (the login an install moved off): only its old token goes, never the one in use.
+  const other = !live && env.META_UNIFIED_APP_SECRET ? await parseSignedRequest(unifiedToken(token) ? env.META_APP_SECRET : env.META_UNIFIED_APP_SECRET, sr) : null;
+  if (!live && !other) return new Response("bad signed_request", { status: 400 });
+  if (live) await env.DB.prepare(`DELETE FROM settings WHERE key IN ('ig_token', 'ig_token_at', 'ig_user_id')`).run();
+  else await env.DB.prepare(`DELETE FROM settings WHERE key = 'ig_token_previous'`).run();
   if (pathname === "/deauthorize") return new Response("ok");
   const code = crypto.randomUUID();
   return Response.json({ url: `${new URL(req.url).origin}/data-deletion?code=${code}`, confirmation_code: code });
@@ -301,6 +346,7 @@ export default {
           cronStep(e, "comment backfill", Date.now(), () => syncComments(e, Date.now())), // comments the webhook missed
           cronStep(e, "backlog replies", Date.now(), async () => tellBacklog(e, await getSetting(e.DB, "ig_token"), Date.now())), // refused comments from before the DM-keyword reply, one a minute
           cronStep(e, "next post", Date.now(), async () => lockNextPost(e.DB, await getSetting(e.DB, "ig_token"), Date.now())), // a Next Post or Reel trigger finds its post
+          cronStep(e, "message keys", Date.now(), () => fillMessageKeys(e.DB)), // messages.mkey: finds a message by either login's id
           cronStep(e, "health", Date.now(), () => checkHealth(e, Date.now())),
         ]),
       ),

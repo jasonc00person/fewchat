@@ -11,7 +11,7 @@ import { STAGES } from "./brain";
 import * as db from "./db";
 import { BASE_URL } from "./links";
 import { COMMUNITY, skoolLinkSql } from "./brand";
-import { react } from "./meta";
+import { midKey, react } from "./meta";
 import { flowChart } from "./flowchart";
 import { waitingLeads } from "./health";
 import { aiBlocker } from "./ready";
@@ -414,13 +414,23 @@ async function threadPanes(env: Env, lead: db.Lead, now: number, msg: string | n
   }
   const who = (m: MediaRow) => (group ? (m.sender ? people.get(m.sender) : undefined) ?? { subscriber_id: "?", username: null, first_name: "Member" } : lead);
   // Swipe-to-reply: the messages being answered, from this page of the thread or looked up when they're older.
-  const byMid = new Map(history.flatMap((m) => (m.mid ? [[m.mid, m] as const] : [])));
-  const older = [...new Set(history.flatMap((m) => (m.reply_to && !byMid.has(m.reply_to) ? [m.reply_to] : [])))];
+  // Keyed by id and by midKey too: after a switch of login, a reply's id for the original isn't the one we stored.
+  const byMid = new Map<string, MediaRow>();
+  const remember = (m: MediaRow) => {
+    if (m.mid) byMid.set(m.mid, m);
+    const k = midKey(m.mid);
+    if (k) byMid.set(k, m);
+  };
+  history.forEach(remember);
+  const original = (to: string) => byMid.get(to) ?? byMid.get(midKey(to) ?? to);
+  const older = [...new Set(history.flatMap((m) => (m.reply_to && !original(m.reply_to) ? [m.reply_to] : [])))].slice(0, 200);
   if (older.length) {
-    const { results } = await env.DB.prepare(`SELECT * FROM messages WHERE subscriber_id = ?1 AND mid IN (SELECT value FROM json_each(?2))`)
-      .bind(lead.subscriber_id, JSON.stringify(older.slice(0, 200)))
+    const { results } = await env.DB.prepare(
+      `SELECT * FROM messages WHERE subscriber_id = ?1 AND (mid IN (SELECT value FROM json_each(?2)) OR mkey IN (SELECT value FROM json_each(?3)))`,
+    )
+      .bind(lead.subscriber_id, JSON.stringify(older), JSON.stringify(older.flatMap((o) => midKey(o) ?? [])))
       .all<MediaRow>();
-    for (const r of results) if (r.mid) byMid.set(r.mid, r);
+    results.forEach(remember);
   }
   const replyName = lead.first_name?.trim().split(/\s+/)[0] || lead.username || "They";
   // IG-style: a centered time above the first message and after any hour-long gap; the sender's picture by the
@@ -434,7 +444,7 @@ async function threadPanes(env: Env, lead: db.Lead, now: number, msg: string | n
       const tail = m.role === "lead" && (!next || !same(next, m) || next.created_at - m.created_at > 10 * 60_000);
       const head = group && m.role === "lead" && (!same(prev, m) || m.created_at - (prev?.created_at ?? 0) > 10 * 60_000);
       const p = who(m);
-      const quote = m.reply_to ? quoteHtml(m, byMid.get(m.reply_to) ?? null, replyName) : "";
+      const quote = m.reply_to ? quoteHtml(m, original(m.reply_to) ?? null, replyName) : "";
       return `${stamp ? `<time data-t="${m.created_at}"></time>` : ""}${head ? `<div class="gs">${esc(p.username || p.first_name || "Member")}</div>` : ""}${quote}${messageHtml(
         m,
         m.mid ? media.get(m.mid) : undefined,

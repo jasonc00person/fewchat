@@ -79,7 +79,8 @@ export async function learnFromHandoffs(env: Env, now: number, extract: typeof e
   for (const h of results) {
     const done = () => env.DB.prepare(`UPDATE drafts SET learned_at = ?2 WHERE id = ?1`).bind(h.id, now).run();
     // The owner's answer = what went out after the handoff before the AI spoke again (a resume lets the AI answer instead).
-    const ai = await env.DB.prepare(`SELECT MIN(created_at) AS at FROM drafts WHERE subscriber_id = ?1 AND id > ?2 AND status = 'sent' AND COALESCE(note, '') != ?3`)
+    // `+status`: keeps SQLite on this lead's drafts instead of every sent draft since.
+    const ai = await env.DB.prepare(`SELECT MIN(created_at) AS at FROM drafts WHERE subscriber_id = ?1 AND id > ?2 AND +status = 'sent' AND COALESCE(note, '') != ?3`)
       .bind(h.subscriber_id, h.id, MANUAL_NOTE)
       .first<{ at: number | null }>();
     const holdOn = new Set(JSON.parse(h.bubbles) as string[]); // the handoff's own "lemme double check that for u"

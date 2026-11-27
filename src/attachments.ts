@@ -6,7 +6,7 @@
 // Nothing is copied: once Instagram drops the media, the thread shows the placeholder text.
 
 import * as db from "./db";
-import { graph } from "./meta";
+import { graph, midKey } from "./meta";
 
 export type PartType =
   | "image"
@@ -220,7 +220,7 @@ export async function saveParts(d1: D1Database, mid: string, parts: Part[]): Pro
 // Which message `mid` replies to. The webhook and our own send both say it (whichever lands after the row exists wins);
 // it never changes once set.
 export async function saveReplyTo(d1: D1Database, mid: string, replyTo: string): Promise<void> {
-  await d1.prepare(`UPDATE messages SET reply_to = ?2 WHERE mid = ?1 AND reply_to IS NULL`).bind(mid, replyTo).run();
+  await d1.prepare(`UPDATE messages SET reply_to = ?2 WHERE (mid = ?1 OR mkey = ?3) AND reply_to IS NULL`).bind(mid, replyTo, midKey(mid)).run();
 }
 
 export type MessageUpdate =
@@ -228,24 +228,28 @@ export type MessageUpdate =
   | { kind: "edit"; mid: string; text: string }
   | { kind: "unsend"; mid: string };
 
+// The message an update names, by its id from either login (an update after a switch can name an older message).
+const byMid = (mid: number, key: number) => `(mid = ?${mid} OR mkey = ?${key})`;
+
 export async function applyUpdate(d1: D1Database, u: MessageUpdate, now: number): Promise<void> {
+  const key = midKey(u.mid);
   if (u.kind === "reaction") {
     const path = `$.${u.who}`;
     await d1
-      .prepare(`UPDATE messages SET reactions = CASE WHEN ?2 IS NULL THEN json_remove(COALESCE(reactions, '{}'), ?3) ELSE json_set(COALESCE(reactions, '{}'), ?3, ?2) END WHERE mid = ?1`)
-      .bind(u.mid, u.emoji, path)
+      .prepare(`UPDATE messages SET reactions = CASE WHEN ?2 IS NULL THEN json_remove(COALESCE(reactions, '{}'), ?3) ELSE json_set(COALESCE(reactions, '{}'), ?3, ?2) END WHERE ${byMid(1, 4)}`)
+      .bind(u.mid, u.emoji, path, key)
       .run();
   } else if (u.kind === "edit") {
     // Keep the leading tags (a story reply stays one); the typed part is what changed.
-    const row = await d1.prepare(`SELECT text FROM messages WHERE mid = ?1`).bind(u.mid).first<{ text: string }>();
+    const row = await d1.prepare(`SELECT id, text FROM messages WHERE ${byMid(1, 2)}`).bind(u.mid, key).first<{ id: number; text: string }>();
     if (!row) return;
     const prefix = splitText(row.text).tags.map((t) => `[${t.tag}]${t.note ? ` "${t.note}"` : ""}`).join(" ");
-    await d1.prepare(`UPDATE messages SET text = ?2, edited_at = ?3 WHERE mid = ?1`).bind(u.mid, [prefix, u.text].filter(Boolean).join(" "), now).run();
+    await d1.prepare(`UPDATE messages SET text = ?2, edited_at = ?3 WHERE id = ?1`).bind(row.id, [prefix, u.text].filter(Boolean).join(" "), now).run();
   } else {
     // They took it back: drop what it said and showed (Platform Terms: delete when the user deletes).
     await d1.batch([
-      d1.prepare(`UPDATE messages SET text = '[unsent a message]', attachments = NULL, reactions = NULL, unsent_at = ?2 WHERE mid = ?1`).bind(u.mid, now),
-      d1.prepare(`DELETE FROM media_cache WHERE mid = ?1`).bind(u.mid),
+      d1.prepare(`DELETE FROM media_cache WHERE mid = ?1 OR mid IN (SELECT mid FROM messages WHERE mkey = ?2)`).bind(u.mid, key),
+      d1.prepare(`UPDATE messages SET text = '[unsent a message]', attachments = NULL, reactions = NULL, unsent_at = ?2 WHERE ${byMid(1, 3)}`).bind(u.mid, now, key),
     ]);
   }
 }
@@ -329,9 +333,14 @@ async function viaConversation(token: string, leadId: string, want: Set<string>)
     `/me/conversations?platform=instagram&user_id=${encodeURIComponent(leadId)}&fields=${encodeURIComponent(fields)}`,
     { headers: { Authorization: `Bearer ${token}` } },
   );
+  // Asked for by the ids we stored, answered with the ids of the login in use: match on the key both carry.
+  const byKey = new Map([...want].map((w) => [midKey(w) ?? w, w]));
   let page = conv.data[0]?.messages;
   for (let n = 0; page && n < 3; n++) {
-    for (const m of page.data ?? []) if (want.has(m.id)) out.set(m.id, { parts: partsFromApi(m), reactions: (m.reactions?.data ?? []).map((r) => r.reaction ?? "").filter(Boolean) });
+    for (const m of page.data ?? []) {
+      const w = want.has(m.id) ? m.id : byKey.get(midKey(m.id) ?? m.id);
+      if (w) out.set(w, { parts: partsFromApi(m), reactions: (m.reactions?.data ?? []).map((r) => r.reaction ?? "").filter(Boolean) });
+    }
     if (out.size === want.size || !page.paging?.next) break;
     page = await graph(page.paging.next.replace(/^https:\/\/graph\.instagram\.com\/v[\d.]+/, ""), { headers: { Authorization: `Bearer ${token}` } });
   }
@@ -438,7 +447,7 @@ export async function mediaRoute(d1: D1Database, req: Request, pathname: string,
       try {
         r = await resolveOne(token, row.mid!);
       } catch (e) {
-        r = transient(e) ? undefined : { parts: [], reactions: [] };
+        r = transient(e) ? undefined : ((await viaConversation(token, row.subscriber_id, new Set([row.mid!])).catch(() => null))?.get(row.mid!) ?? { parts: [], reactions: [] });
       }
       if (r) await store(d1, row.mid!, r, now);
       if (r?.parts.length) res = await pull(pick(r.parts), range);

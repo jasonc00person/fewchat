@@ -203,14 +203,14 @@ export function actsHtml(m: { mid: string | null; created_at: number; role: stri
 
 // IG's swipe-to-reply, drawn above the reply: who answered whom, over a dimmed copy of the message it answers. Tapping
 // the copy scrolls to the original. `orig` is null when that message isn't in our history (older than the import).
-type Quoted = Pick<MediaRow, "role" | "text" | "unsent_at">;
+type Quoted = Pick<MediaRow, "role" | "text" | "unsent_at"> & { mid?: string | null };
 export function quoteHtml(m: Pick<MediaRow, "role" | "reply_to">, orig: Quoted | null, name: string): string {
   if (!m.reply_to) return "";
   const toLead = orig ? orig.role === "lead" : null;
   const label = m.role === "bot" ? (toLead === false ? "You replied to yourself" : "You replied") : toLead ? `${name} replied to themself` : `${name} replied to you`;
   const unsent = Boolean(orig && (orig.unsent_at || splitText(orig.text).tags.some((t) => tagType(t.tag) === "unsent")));
   const body = !orig ? "Message unavailable" : unsent ? "Unsent message" : previewText(orig.text).replace(/^Sent an? (.)/, (_, c: string) => c.toUpperCase());
-  return `<div class="rq ${m.role}${!orig || unsent ? " gone" : ""}"><small>${esc(label)}</small><button type="button" class="rq-b" data-to="${esc(m.reply_to)}" onclick="rqj(this)">${esc(body)}</button></div>`;
+  return `<div class="rq ${m.role}${!orig || unsent ? " gone" : ""}"><small>${esc(label)}</small><button type="button" class="rq-b" data-to="${esc(orig?.mid ?? m.reply_to)}" onclick="rqj(this)">${esc(body)}</button></div>`;
 }
 
 export const THREAD_ASSETS = `<style>

@@ -66,6 +66,12 @@ async function connected() {
 }
 const thread = async (env: Env) => (await db.history(env.DB, LEAD)).map((m) => [m.role, m.text]);
 
+// Both logins' ids for one message: different encodings, the same <account>:<thread>:<item> inside (src/meta.ts midKey).
+const b64 = (x: string) => Buffer.from(x, "latin1").toString("base64").replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_");
+const KEY = `${ME}:340282366841710300000000000000000000042:33126198863773447199684586547183616`;
+const oldMid = (k = KEY) => b64("ig_d") + b64("\x01\xb5}item:1:IGMessageID:" + k);
+const newMid = (k = KEY) => b64("new_ig_dm_") + b64("itd\x05IGMessageID:" + k);
+
 describe("missed-DM sync", () => {
   it("appends only the missing tail of a thread, in order, without duplicating what the webhook already saved", async () => {
     const env = await connected();
@@ -92,6 +98,20 @@ describe("missed-DM sync", () => {
     expect(lead.last_inbound_at).toBe(T0 + 3 * MIN); // their missed message reopens the 24h window
     expect(lead.status).toBe("active"); // our missed reply is recorded but never pauses the AI
     expect(await syncRecent(env, T0 + 5 * MIN)).toBe(0); // nothing twice
+  });
+
+  it("after a switch of login, a bubble the listing returns under its new id isn't recorded twice", async () => {
+    const env = await connected();
+    await db.recordInbound(env.DB, { subscriber_id: LEAD, username: "lead.handle", first_name: null, text: "hey", mid: "m1" }, T0);
+    // Our bubble is stored with the draft's start time; it really went out 15 s later, which is what the listing says.
+    await env.DB.prepare(`INSERT INTO messages (subscriber_id, role, text, created_at, mid) VALUES (?1, 'bot', 'yo whats good', ?2, ?3)`).bind(LEAD, T0 + MIN, oldMid()).run();
+    await db.fillMessageKeys(env.DB);
+    threads = [{ updated: T0 + MIN + 15_000, lead: LEAD, msgs: [{ id: newMid(), at: T0 + MIN + 15_000, from: ME, text: "yo whats good" }] }];
+    expect(await syncRecent(env, T0 + 2 * MIN)).toBe(0);
+    expect(await thread(env)).toEqual([
+      ["lead", "hey"],
+      ["bot", "yo whats good"],
+    ]);
   });
 
   it("brings in a brand-new lead the webhook never saw, with their profile", async () => {

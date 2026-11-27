@@ -99,8 +99,35 @@ const RETRYABLE = /rate|limit|too many|temporar|try again|timeout|timed out|netw
 const THROTTLED = /thread does not exist/i;
 const THROTTLE_COOL_MS = 10 * 60_000;
 
-const sentLastHour = async (db: D1Database, now: number) =>
-  (await db.prepare(`SELECT COUNT(*) n FROM comments WHERE sent_at > ?1`).bind(now - HOUR).first<{ n: number }>())?.n ?? 0;
+// Private replies sent in the last hour. Counting reads one index row per reply, and every matched comment asks, so on
+// a viral post that's up to 700 × 700 rows an hour. So the cron counts exactly once a minute and saves the part of the
+// hour older than LATE_MS (setting `comment_sent_hour`, "<older>:<at>"), and a comment adds a live count of everything
+// stamped after that. A send is stamped with the time its call started and written up to minutes later (the drain and
+// the backfill stamp a whole pass with one time), so the last LATE_MS are always counted live: a cron run can't outlast
+// it (Cloudflare stops one at 15 minutes), so no late write is missed. Replies that aged out of the hour since the save
+// still count, so it can read a little high, never low.
+const SENT_HOUR = "comment_sent_hour";
+const SENT_FRESH_MS = 2 * 60_000;
+const LATE_MS = 20 * 60_000;
+
+async function countSentLastHour(db: D1Database, now: number): Promise<number> {
+  const r = await db
+    .prepare(`SELECT COUNT(*) n, COUNT(CASE WHEN sent_at > ?2 THEN 1 END) late FROM comments WHERE sent_at > ?1`)
+    .bind(now - HOUR, now - LATE_MS)
+    .first<{ n: number; late: number }>();
+  const n = r?.n ?? 0;
+  await db.prepare(`INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = excluded.value`).bind(SENT_HOUR, `${n - (r?.late ?? 0)}:${now}`).run();
+  return n;
+}
+
+// A caller's `now` can be older than the saved count (the backfill's pass time): the saved count is still the latest.
+async function sentLastHour(db: D1Database, now: number): Promise<number> {
+  const saved = (await db.prepare(`SELECT value FROM settings WHERE key = ?1`).bind(SENT_HOUR).first<{ value: string }>())?.value;
+  const [older, at] = (saved ?? "").split(":").map(Number);
+  if (!saved || !(now - at <= SENT_FRESH_MS)) return countSentLastHour(db, now);
+  const late = await db.prepare(`SELECT COUNT(*) n FROM comments WHERE sent_at > ?1`).bind(at - LATE_MS).first<{ n: number }>();
+  return older + (late?.n ?? 0);
+}
 
 // A comment is saved as 'new' and only becomes 'ignored' once nothing matched it. If the database restarts in between
 // (Cloudflare resets it when a query runs out of CPU), it stays 'new' and drainComments finishes it: Instagram's retry
@@ -322,7 +349,7 @@ export async function drainComments(db: D1Database, token: string | null, skoolL
     .all<{ comment_id: string; subscriber_id: string; username: string | null; media_id: string | null; text: string }>();
   for (const r of cut) await matchComment(db, token, skoolLink, { comment_id: r.comment_id, lead_id: r.subscriber_id, username: r.username, media_id: r.media_id, text: r.text }, now);
   await tellRefused(db, token, now).catch((e) => logError(db, "refused comment reply", null, e, now));
-  const room = Math.min(40, HOURLY_BUDGET - (await sentLastHour(db, now)));
+  const room = Math.min(40, HOURLY_BUDGET - (await countSentLastHour(db, now)));
   if (room <= 0) return 0;
   // DMs Instagram refused as too many new conversations wait while it's still refusing live comments (the live ones
   // are the probe), then go 4 a minute, so retries never pile onto the throttle and push it to a full block.

@@ -9,6 +9,7 @@ import { runBroadcasts } from "../src/broadcast";
 import * as db from "../src/db";
 import { handleRead } from "../src/flows";
 import { graphStats } from "../src/graph";
+import { learnFromHandoffs } from "../src/learn";
 import worker from "../src/index";
 import type { Env } from "../src/setter";
 
@@ -49,6 +50,16 @@ describe("hot queries stay on indexes", () => {
     const { d1, spy, sql } = recording();
     await db.leadsNeedingDraft(spy, NOW, 45_000, false);
     await db.leadsNeedingDraft(spy, NOW, 45_000, true);
+    expect(await problems(d1, sql)).toEqual([]);
+  });
+
+  it("handoffs waiting to be learned from", async () => {
+    const { d1, spy, sql } = recording();
+    await d1.prepare(`INSERT INTO leads (subscriber_id, created_at) VALUES ('1', ?1)`).bind(NOW).run();
+    await d1.prepare(`INSERT INTO drafts (subscriber_id, after_message_id, action, bubbles, status, created_at) VALUES ('1', 0, 'handoff', '[]', 'sent', ?1)`).bind(NOW - 60_000).run();
+    await learnFromHandoffs(env(spy), NOW, async () => []);
+    expect(sql.some((s) => s.includes("SELECT MIN(created_at) AS at FROM drafts"))).toBe(true); // the per-handoff lookups ran
+    expect(sql.some((s) => s.includes("d.learned_at IS NULL"))).toBe(true);
     expect(await problems(d1, sql)).toEqual([]);
   });
 
