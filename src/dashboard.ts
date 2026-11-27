@@ -259,7 +259,9 @@ function filterQs(q: URLSearchParams): string {
   return s ? `?${s}` : "";
 }
 
-export async function inboxPage(env: Env, who: Role, q: URLSearchParams, now: number, lead: db.Lead | null = null): Promise<Response> {
+// `panes`: the Inbox's own live refreshes, hover prefetches and clicks (header X-Inbox: panes) only swap the list and
+// thread panes in, never the "N conversations" line or the tag picker, so those two queries are skipped for them.
+export async function inboxPage(env: Env, who: Role, q: URLSearchParams, now: number, lead: db.Lead | null = null, panes = false): Promise<Response> {
   const aiOn = env.AUTOPILOT === "true";
   const search = (q.get("q") ?? "").trim().replace(/^@/, "");
   const status = q.get("status") ?? "";
@@ -282,12 +284,17 @@ export async function inboxPage(env: Env, who: Role, q: URLSearchParams, now: nu
     .all<InboxRow>();
   const more = results.length > PAGE;
   if (more) results.pop();
-  const total = (await env.DB.prepare(`SELECT COUNT(*) n FROM leads l WHERE ${where}`).bind(...args).first<{ n: number }>())?.n ?? 0;
-  const { results: allTags } = await env.DB.prepare(
-    `SELECT DISTINCT t.tag FROM lead_tags t JOIN leads l ON l.subscriber_id = t.subscriber_id WHERE ?1 = 'admin' OR l.test = 1 ORDER BY t.tag`,
-  )
-    .bind(who)
-    .all<{ tag: string }>();
+  // Counting reads every lead that matches, so a first page that isn't full counts itself.
+  const total = panes
+    ? null
+    : pageNo === 0 && !more
+      ? results.length
+      : ((await env.DB.prepare(`SELECT COUNT(*) n FROM leads l WHERE ${where}`).bind(...args).first<{ n: number }>())?.n ?? 0);
+  const { results: allTags } = panes
+    ? { results: [] }
+    : await env.DB.prepare(`SELECT DISTINCT t.tag FROM lead_tags t JOIN leads l ON l.subscriber_id = t.subscriber_id WHERE ?1 = 'admin' OR l.test = 1 ORDER BY t.tag`)
+        .bind(who)
+        .all<{ tag: string }>();
 
   const fq = filterQs(q);
   const chipHref = (k: "status" | "stage" | "", v: string) => {
@@ -342,13 +349,15 @@ export async function inboxPage(env: Env, who: Role, q: URLSearchParams, now: nu
     <input name="q" value="${esc(search)}" placeholder="Search @username" aria-label="Search">${status ? `<input type="hidden" name="status" value="${esc(status)}">` : ""}${
       stage ? `<input type="hidden" name="stage" value="${esc(stage)}">` : ""
     }${tag ? `<input type="hidden" name="tag" value="${esc(tag)}">` : ""}</form>
-    <div class="count"><span>${total.toLocaleString("en-US")} conversation${total === 1 ? "" : "s"}</span><span class="fl">${stageSelect}${tagSelect}</span></div></div>
+    <div class="count"><span>${total === null ? "" : `${total.toLocaleString("en-US")} conversation${total === 1 ? "" : "s"}`}</span><span class="fl">${stageSelect}${tagSelect}</span></div></div>
     <div class="convs">${rows || '<div class="empty" style="padding:16px 24px">No conversations match.</div>'}${pager(q, pageNo, more)}</div></section>`;
 
   const body = lead
     ? await threadPanes(env, lead, now, q.get("msg"), fq)
     : `<section class="pane ib-thread"><div class="placeholder"><span class="ring">${icon("send", 44, 1.4)}</span><b>Your messages</b>Select a conversation to start chatting</div></section>`;
-  return page("Inbox", `${THREAD_ASSETS}<div class="ib${lead ? " open" : ""}">${list}${body}</div>${INBOX_JS}`, who, env);
+  const res = await page("Inbox", `${THREAD_ASSETS}<div class="ib${lead ? " open" : ""}">${list}${body}</div>${INBOX_JS}`, who, env);
+  res.headers.set("Vary", "X-Inbox"); // the browser must never show a panes-only copy as the page (back / forward)
+  return res;
 }
 
 // Newer / Older links under the list, keeping the filters.
@@ -540,7 +549,7 @@ function parse(h){return new DOMParser().parseFromString(h,"text/html")}
 function swap(sel,d,keep){var a=document.querySelector(sel),b=d.querySelector(sel);if(!a||!b||a.innerHTML===b.innerHTML||a.contains(document.activeElement))return false;
 var bottom=a.scrollHeight-a.scrollTop-a.clientHeight<80,top=a.scrollTop;a.innerHTML=b.innerHTML;a.scrollTop=keep&&bottom?a.scrollHeight:top;return true}
 function ready(box){if(!box)return;if(window.fmtTimes)fmtTimes(box);if(window.initMsgs)initMsgs(box)}
-function pull(){fetch(location.href,{credentials:"same-origin"}).then(function(r){return r.ok?r.text():null}).then(function(h){if(!h)return;
+function pull(){fetch(location.href,{credentials:"same-origin",headers:{"X-Inbox":"panes"}}).then(function(r){return r.ok?r.text():null}).then(function(h){if(!h)return;
 var d=parse(h);swap(".convs",d,false);swap(".ib-side",d,false);var th=document.querySelector(".th-head form"),nh=d.querySelector(".th-head form");if(th&&nh)th.innerHTML=nh.innerHTML;
 if(!document.querySelector(".msgs .pending")&&swap(".msgs",d,true))ready(document.querySelector(".msgs"))}).finally(function(){busy=false;if(again){again=false;now()}})}
 function now(){if(busy){again=true;return}busy=true;pull()}
@@ -548,7 +557,7 @@ function sock(){try{ws=new WebSocket((location.protocol==="https:"?"wss://":"ws:
 ws.onmessage=function(e){if(e.data==="pong")return;clearTimeout(soon);soon=setTimeout(now,100)};ws.onclose=function(){ws=null;setTimeout(sock,2000)}}
 function tick(){if(document.hidden||busy)return;if(ws&&ws.readyState===1&&Date.now()-polled<15000)return;polled=Date.now();fetch(stampUrl(),{credentials:"same-origin"}).then(function(r){return r.ok?r.json():null}).then(function(j){if(!j)return;
 if(last!==null&&j.v!==last){busy=true;pull()}last=j.v}).catch(function(){})}
-function load(href){var c=cache[href];if(c&&Date.now()-c.t<15000)return c.p;var p=fetch(href,{credentials:"same-origin"}).then(function(r){if(!r.ok)throw r;return r.text()});
+function load(href){var c=cache[href];if(c&&Date.now()-c.t<15000)return c.p;var p=fetch(href,{credentials:"same-origin",headers:{"X-Inbox":"panes"}}).then(function(r){if(!r.ok)throw r;return r.text()});
 cache[href]={t:Date.now(),p:p};p.catch(function(){delete cache[href]});return p}
 function conv(e){var a=e.target.closest&&e.target.closest("a.conv");return a&&a.origin===location.origin?a:null}
 function open(href,push){var ib=document.querySelector(".ib");if(!ib){location.href=href;return}
@@ -732,7 +741,7 @@ export async function consoleRoute(env: Env, req: Request, pathname: string, who
   if (pathname === "/admin/contacts" && req.method === "GET") return contactsPage(env, who, url.searchParams);
   if (pathname === "/admin/profile" && req.method === "GET") return profilePage(env, who);
   if (pathname === "/admin/help" && req.method === "GET") return helpPage(env, who);
-  if (pathname === "/admin/inbox" && req.method === "GET") return inboxPage(env, who, url.searchParams, now);
+  if (pathname === "/admin/inbox" && req.method === "GET") return inboxPage(env, who, url.searchParams, now, null, req.headers.get("X-Inbox") === "panes");
   if (pathname === "/admin/live" && req.method === "GET") return Response.json({ v: await liveStamp(env, url.searchParams.get("lead"), now) });
   // The master AI switch in the sidebar: one tap flips autopilot for every thread.
   if (pathname === "/admin/ai" && req.method === "POST") {
@@ -765,7 +774,7 @@ export async function consoleRoute(env: Env, req: Request, pathname: string, who
   const lead = await db.getLead(env.DB, m[1]);
   if (!lead) return new Response("not found", { status: 404 });
   if (who === "review" && !lead.test) return forbidden;
-  if (!m[2]) return req.method === "GET" ? inboxPage(env, who, url.searchParams, now, lead) : null;
+  if (!m[2]) return req.method === "GET" ? inboxPage(env, who, url.searchParams, now, lead, req.headers.get("X-Inbox") === "panes") : null;
   if (req.method !== "POST") return null;
 
   const form = await req.formData();

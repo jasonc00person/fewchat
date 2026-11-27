@@ -18,7 +18,7 @@ Check, and help with whatever is missing:
 - `node -v` is 22 or newer. If not: nodejs.org, the LTS installer, then reopen the terminal.
 - They have an **Instagram professional account** (Business or Creator). In the Instagram app: Settings → Account type and tools → Switch to professional account. Free.
 - They have a **Facebook account** they can log in to (for Meta's developer site).
-- A **Cloudflare account** is created during setup if they don't have one. Free to start.
+- A **Cloudflare account** is created during setup if they don't have one. Setting up and trying FewChat is free; real use needs Workers Paid, $5 a month. Tell them now, so it isn't a surprise later.
 
 ## 1. Three answers
 
@@ -117,10 +117,11 @@ From a **second** Instagram account (a friend's or a spare; a message to yoursel
 
 Done = both worked. Show them where things are: the console address, `MY-SETUP.md`, `npm run check`, `npm run update`.
 
+Then the plan: if their Cloudflare account is still on the free plan, tell them FewChat needs Workers Paid ($5 a month) before they rely on it or move automations over from another tool: dash.cloudflare.com → Workers & Pages → Plans. On the free plan Cloudflare cuts each background run off after 10 milliseconds of processing, so delays longer than 15 seconds, follow-ups, retries, broadcasts and phone alerts stop working.
+
 ## 6. Offer the extras, one question each
 
 - **Phone alerts** (recommended): install the free ntfy app, subscribe to a long random topic, put it in `.env` as `ALERT_TOPIC=`, run `npm run setup`.
-- **Workers Paid** ($5 a month): once people message them daily. See docs/HOW-IT-WORKS.md, "What it costs to run".
 - **AI replies (beta)**: docs/AI.md. When they say "help me write the AI script": interview them one short question at a time (what they sell, the price, what's inside, real member results, who buys), and ask them to paste 10 to 20 messages they really typed to people in their DMs. Build the voice from those messages, not from adjectives. Fill every `<<FILL: ...>>` in `src/prompt.ts` and `src/knowledge.ts`, keep the framework, objections and actions as written, then `npm run setup`. They add `ANTHROPIC_API_KEY=` to `.env` themselves.
 - **Also running Manychat on this account?** Read CLAUDE.md, "Manychat", before moving any keyword over.
 - **Past conversations**: `scripts/backfill.mjs` imports DM history (CLAUDE.md, Lab Notes). 90 days is plenty.

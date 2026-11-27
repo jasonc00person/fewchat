@@ -483,4 +483,37 @@ describe("inbox at scale + master switch", () => {
     expect(second).toContain('href="/admin/inbox/1"');
     expect(second).not.toContain("/admin/inbox/60");
   });
+
+  // The count reads every lead. The Inbox's live refreshes, hover prefetches and clicks swap only the panes, so they
+  // send X-Inbox: panes and skip it; a first page that isn't full is its own count.
+  it("counts conversations only when the line is shown and a page can't count itself", async () => {
+    const env = makeEnv();
+    const sql: string[] = [];
+    const real = env.DB;
+    env.DB = { prepare: (s: string) => (sql.push(s), real.prepare(s)), batch: real.batch } as unknown as D1Database;
+    const counted = () => sql.filter((s) => s.startsWith("SELECT COUNT(*) n FROM leads l WHERE")).length;
+    const tagged = () => sql.filter((s) => s.startsWith("SELECT DISTINCT t.tag")).length;
+    for (let i = 1; i <= 3; i++) await db.recordInbound(env.DB, lead(String(i), `u${i}`, `msg ${i}`), Date.now() - i * MIN);
+
+    const full = await (await worker.fetch(as("pw", "/admin/inbox"), env, ctx)).text();
+    expect(full).toContain("3 conversations");
+    expect(full.match(/"X-Inbox":"panes"/g)?.length).toBe(3); // live refresh, prefetch / click, hand reply
+    expect(counted()).toBe(0);
+    expect(tagged()).toBe(1);
+
+    for (const path of ["/admin/inbox", "/admin/inbox/2"]) {
+      sql.length = 0;
+      const res = await worker.fetch(as("pw", path, { headers: { "X-Inbox": "panes" } }), env, ctx);
+      expect(res.headers.get("Vary")).toBe("X-Inbox");
+      const html = await res.text();
+      expect(html).toContain("/admin/inbox/3"); // the list pane is still there to swap in
+      expect(html).not.toContain("conversations</span>");
+      expect(counted() + tagged()).toBe(0);
+    }
+
+    for (let i = 4; i <= 55; i++) await db.recordInbound(env.DB, lead(String(i), `u${i}`, `msg ${i}`), Date.now() - i * MIN);
+    sql.length = 0;
+    expect(await (await worker.fetch(as("pw", "/admin/inbox"), env, ctx)).text()).toContain("55 conversations");
+    expect(counted()).toBe(1);
+  });
 });

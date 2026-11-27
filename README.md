@@ -6,6 +6,9 @@ It's open source and runs on your own Cloudflare account through Instagram's off
 
 **You don't need to know how to code.** One command sets it up and tells you what to click.
 
+> [!NOTE]
+> **Running FewChat costs $5 a month.** The software is free, and so is setting it up and trying it out, but real use needs Cloudflare's Workers Paid plan. See [What it costs](#what-it-costs), with a note from Jason.
+
 ![FewChat's Home page: messages, reach, reply rate and top automations](assets/screenshots/home.png)
 
 <sub>Screenshots show made-up sample data. You can open the same console on your own computer with `npm run preview`.</sub>
@@ -33,10 +36,26 @@ It's open source and runs on your own Cloudflare account through Instagram's off
 | --- | --- | --- |
 | An Instagram **professional** account | Free | Business or Creator. Switch in the Instagram app: Settings → Account type and tools. |
 | A Facebook account | Free | Used once, to register your own app with Meta. Instagram requires that for any DM tool. |
-| A Cloudflare account | Free to start | This is where FewChat runs. Setup creates it with you. Busy accounts should move to Workers Paid, $5 a month. |
+| A Cloudflare account | $5 a month | This is where FewChat runs. Setup creates the account with you. Setting up and trying FewChat is free; real use needs Workers Paid. See [What it costs](#what-it-costs). |
 | A computer with Node.js 22+ | Free | Mac, Windows or Linux. Get it from [nodejs.org](https://nodejs.org) (the big "LTS" button). |
 
 Set aside about 45 minutes. Most of it is clicking through Meta's developer site, and setup gives you a page with every click and your own values filled in.
+
+## What it costs
+
+FewChat is free and open source. Running it takes **Cloudflare's Workers Paid plan, $5 a month**. Instagram and Meta charge nothing, and the optional AI replies cost a few cents per conversation, paid to Anthropic.
+
+**A note from Jason.** In the reel where I showed FewChat, I said it was free. That was my mistake. I thought Cloudflare's free plan would be enough for smaller accounts without much traffic, and it isn't. Setting FewChat up and trying it out is free. But if you want to really use it and move your automations over from Manychat, you'll need the $5 plan.
+
+**Why the free plan isn't enough.** It stops every run after 10 milliseconds of processing. FewChat's every-minute job (delays longer than 15 seconds, follow-ups, retries, broadcasts, phone alerts, picking up missed messages) needs more than that once an account is in real use, so Cloudflare cuts it off and those parts quietly stop working. The free plan also caps the database at 5 million rows read and 100,000 written a day, and a real inbox goes through that.
+
+**How it compares with Manychat** (US prices on [manychat.com/pricing](https://manychat.com/pricing), November 2026):
+
+- Manychat's cheapest paid plan, Essential, is $14 a month billed yearly, or $17 month to month, for 250 active contacts (the people you interact with in a month).
+- Manychat's price climbs with your active contacts. On monthly billing, 7,500 a month costs $99, 25,000 costs $199 and 50,000 costs $299, each on its cheapest plan with extra contacts billed per person.
+- Cloudflare doesn't charge per contact. Workers Paid includes 10 million requests and 25 billion database rows read a month, and anything past that is billed by usage (a tenth of a cent per million extra rows read), not by contacts. The account FewChat was built on talks to about 7,700 people a month, and its Cloudflare bill is $5 plus tax.
+
+To upgrade: [dash.cloudflare.com](https://dash.cloudflare.com) → Workers & Pages → Plans → Workers Paid.
 
 ## Set it up
 
@@ -169,7 +188,7 @@ Then run `npm run update` again. Git combines the two by itself and only stops a
 
 **Do I need to code?** No. Setup is one command, and automations are built by clicking in the console.
 
-**What does it cost?** FewChat is free. Cloudflare's free plan is enough to start; a busy account should use their $5 a month plan. The optional AI replies cost a few cents per conversation, paid to Anthropic.
+**What does it cost?** $5 a month for Cloudflare's Workers Paid plan, which FewChat needs for real use. The software is free, and you can set it up and try it on Cloudflare's free plan. The optional AI replies cost a few cents per conversation, paid to Anthropic. More in [What it costs](#what-it-costs).
 
 **Is this allowed by Instagram?** It uses only Instagram's official API, the same one other DM tools use, and follows its rules by design (see below). Staying inside them is still your responsibility.
 

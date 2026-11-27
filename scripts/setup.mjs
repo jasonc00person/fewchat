@@ -686,7 +686,7 @@ async function setup() {
     return;
   }
 
-  step("Your Cloudflare account", "Cloudflare runs FewChat for you. The free plan is enough to start.");
+  step("Your Cloudflare account", "Cloudflare runs FewChat for you. Setting up and trying it is free; real use needs Workers Paid, $5 a month.");
   await signIn(c);
   if (!c.url && workerExists(c.worker_name) && !flag("replace")) {
     throw fail([

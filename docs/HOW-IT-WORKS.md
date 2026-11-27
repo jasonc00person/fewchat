@@ -54,7 +54,7 @@ Setup makes them on your computer and puts them in two places:
 
 ## What it costs to run
 
-- **Cloudflare's free plan** covers a quiet account. Its main limit is how much the database can be read in a day; a busy inbox runs through it, and then everything pauses until midnight UTC. Workers Paid ($5 a month) lifts that limit. Move to it once people are messaging you every day.
+- **Cloudflare's Workers Paid plan, $5 a month.** FewChat needs it for real use. Setting up and trying FewChat on the free plan costs nothing, but the free plan stops every run after 10 milliseconds of processing, and FewChat's every-minute job (delays longer than 15 seconds, follow-ups, retries, broadcasts, phone alerts, picking up missed messages) needs more than that once you're really using it. The free plan also caps the database at 5 million rows read and 100,000 written a day, which a real inbox goes through. Workers Paid doesn't charge per contact: it includes 10 million requests and 25 billion database rows read a month, and past that it bills by usage, not by contacts. Upgrade at dash.cloudflare.com → Workers & Pages → Plans.
 - **The AI replies**, if you turn them on, are billed by Anthropic for what they write: roughly a few cents per conversation.
 - **Instagram and Meta** charge nothing.
 

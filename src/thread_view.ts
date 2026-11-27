@@ -331,7 +331,7 @@ function cgrow(t){t.style.height="18px";t.style.height=Math.min(t.scrollHeight,1
 function ckey(e,t){if(e.key==="Enter"&&!e.shiftKey&&!e.isComposing){e.preventDefault();if(t.value.trim())t.form.requestSubmit()}}
 function csend(f){var t=f.querySelector("textarea"),v=t.value.trim();if(!v)return false;var box=document.querySelector(".msgs"),fd=new FormData(f);
 var p=document.createElement("div");p.className="m bot pending";p.textContent=v;box.appendChild(p);box.scrollTop=box.scrollHeight;t.value="";cgrow(t);unrp();t.focus();
-fetch(f.action,{method:"POST",body:fd}).then(function(r){return r.text()}).then(function(h){var d=new DOMParser().parseFromString(h,"text/html"),nm=d.querySelector(".msgs"),er=d.querySelector(".ib-thread .err"),old=document.querySelector(".ib-thread .err");
+fetch(f.action,{method:"POST",body:fd,headers:{"X-Inbox":"panes"}}).then(function(r){return r.text()}).then(function(h){var d=new DOMParser().parseFromString(h,"text/html"),nm=d.querySelector(".msgs"),er=d.querySelector(".ib-thread .err"),old=document.querySelector(".ib-thread .err");
 if(old)old.remove();if(nm){box.innerHTML=nm.innerHTML;fmtTimes(box);box.scrollTop=box.scrollHeight}if(er){box.parentNode.insertBefore(er,box);if(!nm)p.remove()}}).catch(function(){p.classList.remove("pending");p.style.outline="1px solid var(--red)";p.title="Not sent: network error"});return false}
 function emo(b){var open=document.querySelector(".emo");if(open){open.remove();return}var p=document.createElement("div");p.className="emo";
 ["😂","❤️","🔥","🙏","😭","👀","💯","🙌","😅","👍","🤝","💪","🎉","😎","🤔","😍","🫡","🚀","✅","👇","😤","🥲","😮","😢","😡","👏","💸","📈","🤯","😁","🙂","🤣"].forEach(function(e){var x=document.createElement("button");x.type="button";x.textContent=e;

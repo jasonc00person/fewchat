@@ -116,10 +116,11 @@ export async function recordInbound(
 export async function recordEcho(db: D1Database, subscriberId: string, text: string, mid: string, now: number): Promise<boolean> {
   // Bubbles we sent through Manychat were stored without a mid; their echo claims the match instead of adding a copy.
   // One batch, so our own insert can't land between the claim and the insert (that doubled bubbles, 2026-10-29).
+  // `+mid`: keeps SQLite off the unique mid index, where IS NULL matched every unmatched bubble in the table.
   const [claimed, ins] = await db.batch([
     db
       .prepare(
-        `UPDATE messages SET mid = ?3 WHERE id = (SELECT id FROM messages WHERE subscriber_id = ?1 AND role = 'bot' AND mid IS NULL AND text = ?2
+        `UPDATE messages SET mid = ?3 WHERE id = (SELECT id FROM messages WHERE subscriber_id = ?1 AND role = 'bot' AND +mid IS NULL AND text = ?2
            AND created_at > ?4 ORDER BY id LIMIT 1) AND NOT EXISTS (SELECT 1 FROM messages WHERE mid = ?3) RETURNING id`,
       )
       .bind(subscriberId, text, mid, now - 10 * 60 * 1000),
