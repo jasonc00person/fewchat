@@ -3,8 +3,9 @@ import { clearCookie, isPhone, loginPage, ownerId, sessionCookie } from "./sessi
 import { handleEcho } from "./autonomy";
 import { afterInbound } from "./fastpath";
 import { automationsPage, handleAdminPost, role } from "./admin";
-import { drainComments, handleComment, lockNextPost } from "./comments";
+import { drainComments, handleComment, lockNextPost, tellBacklog } from "./comments";
 import { syncComments } from "./comment_sync";
+import { runBroadcasts } from "./broadcast";
 import { checkHealth, cronStep, logError, webhookSeen } from "./health";
 import { flowsAdminPost, flowsPage } from "./admin_flows";
 import { consoleRoute } from "./dashboard";
@@ -265,6 +266,7 @@ export default {
         Promise.all([
           cronStep(e, "setter", Date.now(), () => tick(e, Date.now())),
           cronStep(e, "flow delays", Date.now(), () => runDueFlows(e, Date.now())),
+          cronStep(e, "broadcasts", Date.now(), () => runBroadcasts(e, Date.now())), // a few a minute, inside the 24h window only
           cronStep(e, "skool joins", Date.now(), () => syncJoins(e, Date.now())), // new Skool members, matched to their DM lead
           cronStep(e, "skool roster", Date.now(), () => syncRoster(e, Date.now())), // members + churned, so the setter never pitches a customer
           cronStep(e, "skool facts", Date.now(), () => refreshCommunity(e, Date.now())), // call times, size, activity, classroom
@@ -272,6 +274,7 @@ export default {
           cronStep(e, "funnel moves", Date.now(), () => refreshMoves(e, Date.now())), // the funnel's furthest move per lead
           cronStep(e, "comment queue", Date.now(), async () => drainComments(e.DB, await getSetting(e.DB, "ig_token"), e.SKOOL_LINK, Date.now())),
           cronStep(e, "comment backfill", Date.now(), () => syncComments(e, Date.now())), // comments the webhook missed
+          cronStep(e, "backlog replies", Date.now(), async () => tellBacklog(e, await getSetting(e.DB, "ig_token"), Date.now())), // refused comments from before the DM-keyword reply, one a minute
           cronStep(e, "next post", Date.now(), async () => lockNextPost(e.DB, await getSetting(e.DB, "ig_token"), Date.now())), // a Next Post or Reel trigger finds its post
           cronStep(e, "health", Date.now(), () => checkHealth(e, Date.now())),
         ]),

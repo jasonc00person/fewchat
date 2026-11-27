@@ -619,6 +619,16 @@ describe("the published view: key metrics and the people behind them", () => {
     expect((await list(env, "all", "rv")).contacts.map((c) => c.id)).toEqual(["503"]);
   });
 
+  it("a run that only starts another automation still lists its person", async () => {
+    const env = await seeded();
+    await env.DB.prepare(`INSERT INTO triggers (id, source, keyword, name, dm, enabled, created_at, published_at) VALUES (10, 'dm', 'GUIDE', 'DM fallback', '', 1, 1, 1)`).run();
+    await env.DB.prepare(`INSERT INTO flow_starts (trigger_id, subscriber_id, status, created_at) VALUES (10, '502', 'sent', 6000)`).run();
+    const html = await (await get(env, "/admin/flows/10", "pw")).text();
+    expect(JSON.parse(html.match(/<script type="application\/json" id="fe-data">(.*?)<\/script>/s)![1]).metrics).toEqual({ sends: 1, contacts: 1, opened: 0, clicked: 0 });
+    const all = (await (await get(env, "/admin/flows/10/contacts?set=all", "pw")).json()) as { total: number; contacts: { id: string }[] };
+    expect([all.total, all.contacts.map((c) => c.id)]).toEqual([1, ["502"]]);
+  });
+
   it("tags everyone in a set, once, and the reviewer can't", async () => {
     const env = await seeded();
     const tags = async () => (await env.DB.prepare(`SELECT subscriber_id || ':' || tag AS t FROM lead_tags ORDER BY 1`).all<{ t: string }>()).results.map((r) => r.t);

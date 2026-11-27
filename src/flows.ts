@@ -504,6 +504,18 @@ export async function handleInboundFlow(env: Env, token: string, ev: MetaEvent, 
   if (await startTestRun(env, token, ev.lead_id, sig?.text ?? ev.text, now)) return true;
   const sources = sig?.mention ? ["mention"] : sig?.story ? ["story", "dm"] : ["dm"];
   const text = sig?.text ?? ev.text;
+  // Someone whose comment DM Instagram refused (too many new conversations, src/comments.ts) and who DMs that comment's
+  // keyword, as its public reply told them to, gets the automation for the post they commented on (several posts can
+  // share a keyword). Their queued retry then finds the flow already ran and marks itself repeat.
+  const owed = await env.DB.prepare(
+    `SELECT t.* FROM comments c JOIN triggers t ON t.id = c.trigger_id
+     WHERE c.status = 'queued' AND c.subscriber_id = ?1 AND c.error LIKE '%thread does not exist%' AND t.enabled = 1 AND t.deleted_at IS NULL
+     ORDER BY c.created_at DESC`,
+  )
+    .bind(ev.lead_id)
+    .all<Trigger>();
+  const due = owed.results.find((t) => t.keyword.split(",").some((k) => k.trim() !== "*" && matches(k, text)));
+  if (due && (await startFlow(env, token, due.id, ev.lead_id, now, text))) return true;
   const { results } = await env.DB.prepare(`SELECT * FROM triggers WHERE enabled = 1 AND deleted_at IS NULL AND source IN (SELECT value FROM json_each(?1)) ORDER BY id`)
     .bind(JSON.stringify(sources))
     .all<Trigger>();

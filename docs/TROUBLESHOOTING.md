@@ -61,6 +61,7 @@ These are the steps in `MY-SETUP.md`. The step number is where to look.
 - **"not the thread owner"**: another DM tool on the same Instagram account owns that conversation. Don't run the same keyword in two tools.
 - **Buttons don't show**: buttons and quick replies only appear in the Instagram phone app, not on desktop.
 - **Lots waiting to send**: Instagram allows about 750 comment DMs an hour. FewChat queues the rest and sends them as the hour rolls on.
+- **"The thread owner has archived or deleted this conversation, or the thread does not exist"** on a post that's blowing up: Instagram limits how many new conversations an account can start in an hour, and on a viral post you hit it (roughly 300 an hour). Only people who have never messaged you are refused. FewChat retries them by itself once Instagram eases off, and replies under their comment telling them to DM you the keyword, which gets them the same automation straight away. Pause any broadcast while it's happening, and don't force retries. The full playbook is in `CLAUDE.md` under "When a post goes viral".
 
 ## The console
 

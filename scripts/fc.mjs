@@ -13,8 +13,14 @@
 //   node scripts/fc.mjs on|off <id>               switch a published automation on or off
 //   node scripts/fc.mjs test <id>                 a 3-digit code: DM it to the account to run the automation on you
 //   node scripts/fc.mjs trash <id>                move it to Trash (restore from the console's Trash tab)
+//   node scripts/fc.mjs broadcast <id> [options]  run automation <id> for a list of people, a few a minute, inside the
+//                                                 24h window only (src/broadcast.ts). Set up paused; --go starts it
+//   node scripts/fc.mjs broadcasts                each broadcast: status, sent, how many it could reach right now
 //
 // Options for copy / set: --post next|any|<media id>  --keyword "A,B"  --name "..."  --replies "one|two|three"  --publish
+//                         --graph <file.json> (the whole graph, as fc show <id> --json prints it)
+// Options for broadcast: --from <automation ids, comma> | any  --not-from <ids>  --tag "..."  --skip "member,..."  --per-min 8  --cap 200
+//                        --at 2026-11-27T15:00:00Z  --go | --pause
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 
@@ -48,6 +54,7 @@ const num = (s) => (/^\d+$/.test(s ?? "") ? Number(s) : die("Give an automation 
 const postOf = (m) => (m === "next" ? "next post" : m ? `post ${m}` : "any post");
 
 function patch(g) {
+  if (flags.graph) g = JSON.parse(readFileSync(String(flags.graph), "utf8"));
   const t = g.trigger;
   if (flags.post) t.media_id = flags.post === "any" ? null : String(flags.post);
   if (flags.keyword) t.keyword = String(flags.keyword);
@@ -138,6 +145,44 @@ switch (cmd) {
     const id = num(args[0]);
     await call(`/admin/automations/${id}/delete`);
     console.log(`#${id} is in Trash`);
+    break;
+  }
+  case "broadcast": {
+    const id = num(args[0]);
+    const t = sql(`SELECT name, enabled FROM triggers WHERE id = ${id} AND deleted_at IS NULL`)[0] ?? die(`#${id} doesn't exist`);
+    const key = `broadcast:${id}`;
+    const cur = sql(`SELECT value FROM settings WHERE key = '${key}'`)[0];
+    const b = cur ? JSON.parse(cur.value) : { per_min: 8, cap: 200, skip: ["member"], status: "paused" };
+    const list = (v) => String(v).split(",").map((x) => x.trim()).filter(Boolean);
+    if (flags.from) b.from = flags.from === "any" ? "any" : list(flags.from).map(Number).filter(Boolean);
+    if (flags["not-from"]) b.not_from = list(flags["not-from"]).map(Number).filter(Boolean);
+    if (flags.tag) b.tag = String(flags.tag);
+    if (flags.skip) b.skip = list(flags.skip);
+    if (flags["per-min"]) b.per_min = Number(flags["per-min"]);
+    if (flags.cap) b.cap = Number(flags.cap);
+    if (flags.at) b.start_at = Date.parse(String(flags.at)) || die("--at takes a time like 2026-11-27T15:00:00Z");
+    if (flags.pause) b.status = "paused";
+    if (flags.go) {
+      if (!t.enabled) die(`#${id} isn't live: fc publish ${id} first`);
+      Object.assign(b, { status: "running", idle: 0 });
+      delete b.note;
+    }
+    if (!b.from?.length && !b.tag) die("Say who gets it: --from <automation ids> or --tag <tag>");
+    sql(`INSERT INTO settings (key, value) VALUES ('${key}', '${JSON.stringify(b).replace(/'/g, "''")}') ON CONFLICT (key) DO UPDATE SET value = excluded.value`);
+    const who = [b.from === "any" ? "people who ran any automation" : b.from?.length && `people who ran #${b.from.join(", #")}`, b.not_from?.length && `not #${b.not_from.join(", #")}`, b.tag && `tagged "${b.tag}"`].filter(Boolean).join(", ");
+    console.log(`#${id} ${t.name ?? ""}: ${b.status}, to ${who}, skipping ${["friend", ...(b.skip ?? [])].join(", ")}, ${b.per_min} a minute, cap ${b.cap}${b.start_at ? `, from ${new Date(b.start_at).toISOString()}` : ""}`);
+    if (b.status !== "running") console.log(`Within a minute, fc broadcasts shows how many it can reach. fc broadcast ${id} --go starts it.`);
+    break;
+  }
+  case "broadcasts": {
+    const rows = sql(`SELECT s.key, s.value, t.name, (SELECT COUNT(*) FROM flow_starts f WHERE f.trigger_id = t.id AND f.status = 'sent') sent,
+      (SELECT COUNT(*) FROM flow_starts f WHERE f.trigger_id = t.id AND f.status = 'failed') failed
+      FROM settings s LEFT JOIN triggers t ON t.id = CAST(substr(s.key, 11) AS INTEGER) WHERE s.key LIKE 'broadcast:%' ORDER BY s.key`);
+    if (!rows.length) console.log("No broadcasts yet: fc broadcast <id> --from <ids> sets one up");
+    for (const r of rows) {
+      const b = JSON.parse(r.value);
+      console.log(`#${r.key.slice(10).padEnd(4)} ${b.status.toUpperCase().padEnd(8)} ${String(r.sent).padStart(5)} sent  ${String(r.failed).padStart(3)} failed  ${String(b.left ?? "?").padStart(5)} reachable now  cap ${b.cap}, ${b.per_min}/min  ${r.name ?? ""}${b.note ? `\n      ${b.note}` : ""}`);
+    }
     break;
   }
   default:

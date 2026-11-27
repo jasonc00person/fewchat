@@ -27,6 +27,8 @@ Say your automation is "when someone comments `GUIDE` on this reel, DM them the 
 
 Each person gets an automation once. If they comment the same keyword again, nothing is sent twice.
 
+**When a post goes viral.** Instagram only lets an account start so many new conversations an hour (roughly 300). Past that, it refuses the DM to anyone who has never messaged you. FewChat doesn't give up on them: it replies under their comment telling them to DM you the keyword (a conversation *they* start isn't limited), sends the automation the moment they do, and quietly retries the rest once Instagram eases off. People who did get the DM get your normal public reply.
+
 ## What happens when someone DMs you
 
 The same thing, without the comment. The message arrives in your Inbox right away. If you have an automation for a keyword in DMs, a story reply or a first-ever message, it runs. Otherwise the message waits for you to answer from the Inbox or from the Instagram app.

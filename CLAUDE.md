@@ -28,7 +28,7 @@ Cloudflare Worker `fewchat`, D1 database `fewchat`, queue `fewchat-send`, Durabl
 3. **Drafting.** The webhook fast path waits 5s for a burst to settle, then Claude (`src/brain.ts`, script in `src/prompt.ts`) drafts JSON `reply | stop | react | handoff | flag`, 1-4 bubbles, stage, note. The cron (every minute) is the fallback once a thread has been quiet 45s. It also refreshes the 60-day Instagram token weekly.
 4. **AI on or off, no approval queue.** The switch on the AI page (`autopilot`) sends drafts within seconds; off drafts nothing (flows still run, you reply from the Inbox). Each thread also has its own "turn on here" switch, for testing on one thread while the master switch stays off.
 5. **Outbound.** `POST graph.instagram.com/v26.0/me/messages`, one call per bubble, with seen + typing dots paced at 100 wpm. `{{SKOOL_LINK}}` is filled at send time. **Never sends outside the 24h window** (Instagram's rule for automated messages).
-6. **Comment-to-DM** (`src/comments.ts`): a comment matching a trigger keyword (whole word, any case, `*` = any; post-specific triggers win) gets one private reply DM plus an optional public reply. One DM per person per trigger. The setter only drafts once they answer the DM.
+6. **Comment-to-DM** (`src/comments.ts`): a comment matching a trigger keyword (whole word, any case, `*` = any; post-specific triggers win) gets one private reply DM plus an optional public reply. One DM per person per trigger. The setter only drafts once they answer the DM. On a viral post Instagram refuses some of these DMs: see "When a post goes viral".
 7. **Connect Instagram:** the first "Log in with Instagram" on a fresh install claims and connects it (only the account named in `fewchat.config.json` may), and `/auth/start` (console login) reconnects later. Either runs Instagram business login, stores a 60-day token in D1 `settings`, and subscribes the account to the webhook fields.
 
 ## Automations (node graph)
@@ -80,6 +80,19 @@ Without the token both are skipped and everything else works.
 - **Never set a default IG conversation-routing app on your Facebook Page.** It can break Manychat.
 - Follow-to-DM ("say hi to new followers") is Manychat-only (a Meta-gated event); its DM echoes here as YOU and the follower's reply goes to the setter.
 
+## When a post goes viral
+
+- **The limit.** Past roughly 300 first-time comment DMs an hour, Instagram starts refusing new conversations: `instagram 400 code 100: The thread owner has archived or deleted this conversation, or the thread does not exist.` (subcode 2534001). Only people who have never DM'd the account get it; existing threads keep delivering. Meta doesn't document it (its 750/hour private-reply cap is a different number), it clears on its own once comments slow down, and every tool on the official API runs into it. The wording sounds permanent, but at volume it's this limit.
+- **What FewChat does by itself** (`src/comments.ts`, `src/flows.ts`): a refused comment is queued and retried hourly (12 tries, inside Instagram's 7-day private-reply window). Retries hold while live comments are still being refused and go 4 a minute after 10 quiet minutes, so they never push the account into a full block (an hour of retrying every few minutes can end in a 613 rate limit on everything). Within a minute the comment gets a public reply telling them to DM the keyword (`tellRefused`; never the usual "sent" reply, since nothing was sent). A conversation they open isn't capped: when they DM the keyword, `handleInboundFlow` runs the automation for the post they commented on (several posts can share a keyword), and their queued retry marks itself repeat. Delivered comments get the normal public reply. Only automations with public replies get the "DM me" reply.
+- **The wording** is `FALLBACK_REPLIES` (live) and `BACKLOG_REPLIES` (catch-up) in `src/comments.ts`; `{kw}` becomes the keyword. Change them to your voice and keep several, rotating: Meta's spam policy looks at repeated text as well as volume.
+- **What to do while it's happening:**
+  1. Don't run a broadcast at the same time: `node scripts/fc.mjs broadcasts`, then `fc broadcast <id> --pause`. Broadcast sends go to existing conversations, so they aren't refused and their auto-pause never fires; they just use up the account's room.
+  2. Watch it: `npx wrangler d1 execute fewchat --remote --command "SELECT status, COUNT(*) FROM comments WHERE trigger_id = <id> AND created_at > (strftime('%s','now')-3600)*1000 GROUP BY status"` (`queued` with that error = refused and waiting).
+  3. Don't retry faster, requeue in bulk or post replies by hand in a burst.
+  4. If Instagram ever answers 613, 368 or "action blocked", stop everything for a day.
+- **Catching up old refusals** (comments marked `failed` before you had this, or any you want to tell again): set `status = 'queued'` and `fallback_at = -1` on them. `tellBacklog` posts the catch-up wording to each, one a minute at a random second, newest first, skipping anyone who has since got it. Any reply error other than a deleted comment pauses it for 24 hours (setting `backlog_replies_paused_until`) and sends a phone alert.
+- **Public replies have no published limit.** About 250 an hour has gone out with no errors. Keep it well under a burst.
+
 ## Rules
 
 - Bots reply only within 24h of the lead's last message. Humans (you, from the Instagram app) have no limit.
@@ -98,10 +111,12 @@ npm test            # vitest, real SQL via a node:sqlite D1 shim (test/d1shim.ts
 npm run typecheck
 npm run deploy      # refuses while setup isn't finished
 npx wrangler tail   # live logs
-node scripts/fc.mjs # automations from the terminal: list, show, posts, comments, copy, set, publish, on/off, test, trash
+node scripts/fc.mjs # automations from the terminal: list, show, posts, comments, copy, set, publish, on/off, test, trash, broadcast
 ```
 
 **Use `scripts/fc.mjs` for automation work instead of driving the console in a browser.** It changes automations through the console's own endpoints (so the editor's validation runs), signed in with `ADMIN_PASSWORD` from `.env`, at `ORIGIN` from `src/brand.ts`; lists read D1 through wrangler. A follow-up post on the same keyword is `node scripts/fc.mjs copy <id> --post next --publish`, run before the post goes up. Each automation has its own one-DM-per-person, so someone who comments on both posts gets both DMs.
+
+**Broadcasts** (`src/broadcast.ts`, `node scripts/fc.mjs broadcast <id> --from <automation ids> | --tag <tag>`): run one automation for a list of people, a few a minute from the cron, only for people inside Instagram's 24h window (their last message or tap), soonest-to-close first. It's set up paused; `fc broadcasts` shows how many it can reach, `--go` starts it, `--cap` stops it after that many (send a small batch first), and it pauses itself on any Instagram limit or spam error. Meta publishes no safe number: what gets accounts limited is people blocking and reporting, so ask before you pitch, give an easy no, and keep the first message free of links.
 
 ## Lab Notes
 

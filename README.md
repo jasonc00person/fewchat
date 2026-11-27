@@ -176,7 +176,7 @@ npm test            # the full suite, with real SQL through a local D1 shim
 npm run typecheck
 npm run deploy      # refuses while setup isn't finished
 npx wrangler tail   # live logs
-node scripts/fc.mjs # manage automations from the terminal (list, copy to your next post, publish, on/off, stats)
+node scripts/fc.mjs # manage automations from the terminal (list, copy to your next post, publish, on/off, stats, broadcasts)
 ```
 
 `wrangler.jsonc` and `src/brand.ts` are built from `templates/` and `fewchat.config.json` by `npm run setup` (and on `npm install`), and are git-ignored, as are `src/prompt.ts` and `src/knowledge.ts`. Forking to keep your own version in git? Delete those lines from `.gitignore`. [CLAUDE.md](CLAUDE.md) explains how the code is laid out.

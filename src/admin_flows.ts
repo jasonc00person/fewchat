@@ -516,7 +516,11 @@ const SET_SQL: Record<ContactSet, string> = {
   clicked: "EXISTS (SELECT 1 FROM flow_taps t WHERE t.send_id = s.id)",
 };
 const asSet = (v: unknown): ContactSet => (v === "opened" || v === "clicked" ? v : "all");
-const REACHED = `FROM flow_sends s JOIN leads l ON l.subscriber_id = s.subscriber_id WHERE s.trigger_id = ?1 AND s.status = 'sent' AND (?2 = 'admin' OR l.test = 1)`;
+// Every message it sent, plus each run itself, so a run that only did actions (tag, start another automation) still
+// lists its person. Run rows have no id or seen_at, so they never count as opened or clicked.
+const REACHED = `FROM (SELECT id, subscriber_id, seen_at, created_at FROM flow_sends WHERE trigger_id = ?1 AND status = 'sent'
+    UNION ALL SELECT NULL, subscriber_id, NULL, created_at FROM flow_starts WHERE trigger_id = ?1 AND status = 'sent') s
+  JOIN leads l ON l.subscriber_id = s.subscriber_id WHERE (?2 = 'admin' OR l.test = 1)`;
 
 // Sends = how many times it ran; the rest are people. Opened is a floor (read receipts only).
 export async function keyMetrics(env: Env, id: number, who: Role): Promise<{ sends: number; contacts: number; opened: number; clicked: number }> {

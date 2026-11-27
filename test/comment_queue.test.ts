@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { makeD1 } from "./d1shim";
 import * as db from "../src/db";
-import { drainComments, handleComment, HOURLY_BUDGET } from "../src/comments";
+import { drainComments, handleComment, HOURLY_BUDGET, tellBacklog, tellRefused } from "../src/comments";
+import { pace } from "../src/setter";
+import { handleInboundFlow } from "../src/flows";
 import { syncComments } from "../src/comment_sync";
 import type { Env } from "../src/setter";
 
@@ -91,10 +93,99 @@ describe("private reply queue", () => {
     await handleComment(env.DB, "tok", env.SKOOL_LINK, comment("c2"), T);
     expect((await status(env, "c2")).status).toBe("failed");
 
+    // Too many new conversations at once: Instagram says the thread doesn't exist. It waits an hour, then sends.
+    failNext = "The thread owner has archived or deleted this conversation, or the thread does not exist.";
+    await handleComment(env.DB, "tok", env.SKOOL_LINK, comment("c4"), T);
+    expect(await status(env, "c4")).toEqual({ status: "queued", attempts: 1 });
+    expect(await drainComments(env.DB, "tok", env.SKOOL_LINK, T + 30 * MIN)).toBe(0);
+    // A live comment still gets refused at T+55, so the retry holds off until it's been quiet 10 minutes.
+    failNext = "The thread owner has archived or deleted this conversation, or the thread does not exist.";
+    await handleComment(env.DB, "tok", env.SKOOL_LINK, comment("c5"), T + 55 * MIN);
+    expect(await drainComments(env.DB, "tok", env.SKOOL_LINK, T + 61 * MIN)).toBe(0);
+    expect(await drainComments(env.DB, "tok", env.SKOOL_LINK, T + 66 * MIN)).toBe(1);
+    expect((await status(env, "c4")).status).toBe("sent");
+    expect((await status(env, "c5")).status).toBe("queued");
+
     failNext = "rate limit";
     await handleComment(env.DB, "tok", env.SKOOL_LINK, comment("c3"), T);
     await drainComments(env.DB, "tok", env.SKOOL_LINK, T + 8 * 24 * 60 * MIN);
     expect((await status(env, "c3")).status).toBe("expired");
+  });
+});
+
+describe("refused as too many new conversations", () => {
+  const REFUSED = "The thread owner has archived or deleted this conversation, or the thread does not exist.";
+  const publicReplies = () => calls.filter((c) => c.url.includes("/replies?")).map((c) => new URL(c.url).searchParams.get("message"));
+
+  it("the public reply says to DM the keyword when a DM automation answers it, once, and never says sent", async () => {
+    const env = await setup();
+    await env.DB.prepare(`UPDATE triggers SET public_reply = 'gotchu, sent'`).run();
+    failNext = REFUSED;
+    await handleComment(env.DB, "tok", env.SKOOL_LINK, comment("c1"), T);
+    expect(publicReplies()).toEqual([]); // no "sent" for a DM that didn't go
+
+    failNext = REFUSED;
+    await handleComment(env.DB, "tok", env.SKOOL_LINK, comment("c2"), T + 2 * MIN);
+    expect(await tellRefused(env.DB, "tok", T + 3 * MIN)).toBe(2);
+    expect(publicReplies()).toHaveLength(2);
+    expect(publicReplies()[0]).toMatch(/DM me AGENT/);
+    expect(await tellRefused(env.DB, "tok", T + 4 * MIN)).toBe(0); // once per comment
+
+    // When the retry gets through later, the normal reply goes out too.
+    expect(await drainComments(env.DB, "tok", env.SKOOL_LINK, T + 70 * MIN)).toBe(2);
+    expect(publicReplies().slice(2)).toEqual(["gotchu, sent", "gotchu, sent"]);
+  });
+
+  it("DMing the keyword gets them the automation for the post they commented on; the retry then stands down", async () => {
+    const env = await setup();
+    // A second post shares the keyword: the DM must run the one they commented on.
+    const other = await env.DB.prepare(`INSERT INTO triggers (source, keyword, dm, media_id, enabled, created_at) VALUES ('comment', 'AGENT', '', 'reel2', 1, 1) RETURNING id`).first<{ id: number }>();
+    failNext = REFUSED;
+    await handleComment(env.DB, "tok", env.SKOOL_LINK, comment("c1"), T);
+    await env.DB.prepare(`INSERT INTO leads (subscriber_id, created_at, last_inbound_at) VALUES ('lead-c1', ?1, ?1)`).bind(T + 5 * MIN).run();
+    expect(await handleInboundFlow(env as any, "tok", { lead_id: "lead-c1", text: "Agent" } as any, undefined, false, T + 5 * MIN)).toBe(true);
+    const dms = calls.filter((c) => c.url.endsWith("/me/messages") && c.body?.recipient?.id === "lead-c1" && c.body?.message);
+    expect(dms.map((c) => c.body.message.text)).toEqual(["here you go"]);
+    const starts = (await env.DB.prepare(`SELECT trigger_id FROM flow_starts WHERE subscriber_id = 'lead-c1' AND status = 'sent'`).all<{ trigger_id: number }>()).results;
+    expect(starts.map((r) => r.trigger_id)).not.toContain(other!.id);
+    expect(starts).toHaveLength(1);
+
+    await drainComments(env.DB, "tok", env.SKOOL_LINK, T + 70 * MIN);
+    expect((await status(env, "c1")).status).toBe("repeat");
+    expect(privateReplies()).toHaveLength(1); // only the refused one
+  });
+});
+
+describe("backlog of refused comments", () => {
+  const REFUSED = "The thread owner has archived or deleted this conversation, or the thread does not exist.";
+  const publicReplies = () => calls.filter((c) => c.url.includes("/replies?")).map((c) => new URL(c.url).searchParams.get("message"));
+
+  it("one apology reply a tick, newest first, rotated, skipping anyone who already got it; a refusal stops it for a day", async () => {
+    vi.spyOn(pace, "sleep").mockResolvedValue();
+    const env = await setup();
+    await env.DB.prepare(`UPDATE triggers SET public_reply = 'gotchu, sent'`).run();
+    for (const [id, at] of [["old", T], ["mid", T + MIN], ["new", T + 2 * MIN], ["got", T + 3 * MIN]] as const) {
+      failNext = REFUSED;
+      await handleComment(env.DB, "tok", env.SKOOL_LINK, comment(id), at);
+    }
+    await env.DB.prepare(`UPDATE comments SET fallback_at = -1`).run(); // held, like the night it was built
+    await env.DB.prepare(`UPDATE flow_starts SET status = 'sent' WHERE subscriber_id = 'lead-got'`).run(); // DM'd the keyword already
+    const e = { ...env, ALERT_TOPIC: undefined } as unknown as Env;
+
+    expect(await tellBacklog(e, "tok", T + 10 * MIN)).toBe(true);
+    expect(await tellBacklog(e, "tok", T + 11 * MIN)).toBe(true);
+    const replied = calls.filter((c) => c.url.includes("/replies?")).map((c) => c.url.split("/").at(-2)?.split("?")[0]);
+    expect(replied).toEqual(["new", "mid"]);
+    expect(publicReplies()[0]).toMatch(/DM me AGENT/);
+    expect(publicReplies()[0]).not.toEqual(publicReplies()[1]);
+
+    // Instagram refuses a public reply: nothing more for 24 hours.
+    vi.mocked(fetch).mockImplementationOnce(async () => Response.json({ error: { message: "Action blocked", code: 368 } }, { status: 400 }));
+    expect(await tellBacklog(e, "tok", T + 12 * MIN)).toBe(false);
+    expect(await tellBacklog(e, "tok", T + 13 * MIN)).toBe(false);
+    expect(publicReplies()).toHaveLength(2);
+    expect(await tellBacklog(e, "tok", T + 12 * MIN + 25 * 60 * MIN)).toBe(true);
+    expect(publicReplies()).toHaveLength(3);
   });
 });
 
